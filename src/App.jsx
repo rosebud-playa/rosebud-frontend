@@ -187,7 +187,7 @@ function rowNameStyle(account) {
 /* ----------------------------------------------------------------------
    APP
 ---------------------------------------------------------------------- */
-function Workspace({ token, workspaceName, onLogout, onAuthError }) {
+function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorkspace }) {
   const [values, setValues] = useState({});
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [loadError, setLoadError] = useState(null);
@@ -203,6 +203,14 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
   const [versions, setVersions] = useState([]);
   const [showVersions, setShowVersions] = useState(false);
   const [versionLabel, setVersionLabel] = useState('');
+  const [role, setRole] = useState('viewer');
+  const [myWorkspaces, setMyWorkspaces] = useState([]);
+  const [showMembers, setShowMembers] = useState(false);
+  const [members, setMembers] = useState([]);
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteRole, setInviteRole] = useState('editor');
+  const [membersError, setMembersError] = useState('');
+  const [lastInviteLink, setLastInviteLink] = useState('');
 
   useEffect(() => {
     fetch(`${API_BASE}/workspace`, { headers: { Authorization: `Bearer ${token}` } })
@@ -214,10 +222,70 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
       .then((data) => {
         setValues(data.values);
         setVersions(data.versions);
+        setRole(data.workspace.role);
         setWorkspaceLoaded(true);
       })
       .catch((err) => setLoadError(err.message));
+    fetch(`${API_BASE}/auth/my-workspaces`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => (r.ok ? r.json() : { workspaces: [] }))
+      .then((data) => setMyWorkspaces(data.workspaces || []))
+      .catch(() => {});
   }, [token]);
+
+  const canManageMembers = role === 'admin';
+  const canEditData = role === 'editor' || role === 'power' || role === 'admin';
+
+  function loadMembers() {
+    fetch(`${API_BASE}/workspace/members`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json())
+      .then((data) => setMembers(data.members || []))
+      .catch(() => {});
+  }
+  function sendInvite() {
+    setMembersError('');
+    setLastInviteLink('');
+    fetch(`${API_BASE}/workspace/invite`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ email: inviteEmail.trim(), role: inviteRole }),
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) { setMembersError(data.error || 'Could not send invite.'); return; }
+        setInviteEmail('');
+        setLastInviteLink(data.inviteLink);
+        loadMembers();
+      })
+      .catch(() => setMembersError('Could not send invite.'));
+  }
+  function changeMemberRole(userId, newRole) {
+    setMembersError('');
+    fetch(`${API_BASE}/workspace/members/${userId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ role: newRole }),
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => { if (!ok) setMembersError(data.error || 'Could not update role.'); else loadMembers(); })
+      .catch(() => setMembersError('Could not update role.'));
+  }
+  function removeMember(userId) {
+    setMembersError('');
+    fetch(`${API_BASE}/workspace/members/${userId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => { if (!ok) setMembersError(data.error || 'Could not remove member.'); else loadMembers(); })
+      .catch(() => setMembersError('Could not remove member.'));
+  }
+  function switchWorkspace(workspaceId) {
+    fetch(`${API_BASE}/auth/switch-workspace`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ workspaceId }),
+    })
+      .then((r) => r.json())
+      .then((data) => onSwitchWorkspace(data))
+      .catch(() => setSaveStatus('error'));
+  }
 
   const liveData = values[currentScenario];
 
@@ -336,7 +404,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
     );
   }
 
-  const canEdit = currentEntity !== 'company' && granularity === 'Monthly' && !compareMode;
+  const canEdit = canEditData && currentEntity !== 'company' && granularity === 'Monthly' && !compareMode;
 
   const kpiRevenue = getPeriodValue(liveData, currentEntity, 'revenue', 'FY');
   const kpiExpenses = getPeriodValue(liveData, currentEntity, 'expenses', 'FY');
@@ -387,7 +455,31 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
           </div>
 
           <div className="flex items-center gap-3 flex-wrap">
-            <div style={{ color: COLORS.textOnDarkMuted }} className="text-xs">{workspaceName}</div>
+            <div style={{ color: COLORS.textOnDarkMuted }} className="text-xs flex items-center gap-2">
+              {workspaceName}
+              <span style={{ background: COLORS.bgChrome2, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 4, padding: '1px 6px', fontSize: 11, textTransform: 'capitalize' }}>{role}</span>
+            </div>
+            {myWorkspaces.length > 1 && (
+              <select
+                className="lw-select"
+                value=""
+                onChange={(e) => { if (e.target.value) switchWorkspace(Number(e.target.value)); }}
+                style={{ background: COLORS.bgChrome2, color: COLORS.textOnDark, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 6, padding: '5px 8px', fontSize: 12.5 }}
+              >
+                <option value="">Switch workspace…</option>
+                {myWorkspaces.map((w) => <option key={w.id} value={w.id}>{w.name} ({w.role})</option>)}
+              </select>
+            )}
+            <button
+              onClick={() => { setShowMembers((s) => !s); if (!showMembers) loadMembers(); }}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6, padding: '5px 10px', borderRadius: 6, fontSize: 12.5,
+                background: showMembers ? COLORS.violet : 'none', color: showMembers ? '#fff' : COLORS.textOnDarkMuted,
+                border: `1px solid ${showMembers ? COLORS.violet : COLORS.chromeBorder}`, cursor: 'pointer',
+              }}
+            >
+              Members
+            </button>
             <div className="flex items-center gap-1.5 text-xs" style={{ color: saveStatus === 'error' ? COLORS.brick : COLORS.textOnDarkMuted }}>
               <span style={{
                 width: 6, height: 6, borderRadius: 6, display: 'inline-block',
@@ -709,21 +801,23 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
               <button onClick={() => setShowVersions(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted }}><X size={16} /></button>
             </div>
 
-            <div className="flex items-center gap-2 mb-4">
-              <input
-                type="text"
-                placeholder={`Label (e.g. "${currentScenario} — Q1 sign-off")`}
-                value={versionLabel}
-                onChange={(e) => setVersionLabel(e.target.value)}
-                style={{ flex: 1, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '7px 10px', fontSize: 13 }}
-              />
-              <button
-                onClick={saveVersion}
-                style={{ display: 'flex', alignItems: 'center', gap: 6, background: COLORS.jade, color: '#fff', border: 'none', borderRadius: 6, padding: '7px 12px', fontSize: 13, cursor: 'pointer' }}
-              >
-                <Save size={14} /> Save {currentScenario}
-              </button>
-            </div>
+            {canEditData && (
+              <div className="flex items-center gap-2 mb-4">
+                <input
+                  type="text"
+                  placeholder={`Label (e.g. "${currentScenario} — Q1 sign-off")`}
+                  value={versionLabel}
+                  onChange={(e) => setVersionLabel(e.target.value)}
+                  style={{ flex: 1, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '7px 10px', fontSize: 13 }}
+                />
+                <button
+                  onClick={saveVersion}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, background: COLORS.jade, color: '#fff', border: 'none', borderRadius: 6, padding: '7px 12px', fontSize: 13, cursor: 'pointer' }}
+                >
+                  <Save size={14} /> Save {currentScenario}
+                </button>
+              </div>
+            )}
 
             {versions.length === 0 ? (
               <div style={{ color: COLORS.textMuted }} className="text-xs">No versions saved yet. Snapshot a scenario to compare it later or roll back to it.</div>
@@ -739,17 +833,99 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
                       <button onClick={() => compareWithVersion(v)} title="Compare against this version" style={{ background: COLORS.violetSoft, color: COLORS.violet, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
                         <ArrowLeftRight size={12} /> Compare
                       </button>
-                      <button onClick={() => restoreVersion(v)} title="Restore this snapshot" style={{ background: COLORS.jadeSoft, color: COLORS.jade, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
-                        <RotateCcw size={12} /> Restore
-                      </button>
-                      <button onClick={() => deleteVersion(v.id)} title="Delete" style={{ background: COLORS.brickSoft, color: COLORS.brick, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
-                        <Trash2 size={12} />
-                      </button>
+                      {canEditData && (
+                        <>
+                          <button onClick={() => restoreVersion(v)} title="Restore this snapshot" style={{ background: COLORS.jadeSoft, color: COLORS.jade, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+                            <RotateCcw size={12} /> Restore
+                          </button>
+                          <button onClick={() => deleteVersion(v.id)} title="Delete" style={{ background: COLORS.brickSoft, color: COLORS.brick, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
+                            <Trash2 size={12} />
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 ))}
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* ---------------- Members drawer ---------------- */}
+      {showMembers && (
+        <div className="px-6 pb-6">
+          <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="font-semibold text-sm">Workspace members</div>
+              <button onClick={() => setShowMembers(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted }}><X size={16} /></button>
+            </div>
+
+            {membersError && <div style={{ background: COLORS.brickSoft, color: COLORS.brick, borderRadius: 6, padding: '8px 10px', fontSize: 12.5, marginBottom: 12 }}>{membersError}</div>}
+            {lastInviteLink && (
+              <div style={{ background: COLORS.jadeSoft, color: COLORS.jade, borderRadius: 6, padding: '8px 10px', fontSize: 12, marginBottom: 12, wordBreak: 'break-all' }}>
+                Invite sent. If email isn't configured yet, share this link directly: {lastInviteLink}
+              </div>
+            )}
+
+            {canManageMembers && (
+              <div className="flex items-center gap-2 mb-4">
+                <input
+                  type="email"
+                  placeholder="teammate@company.com"
+                  value={inviteEmail}
+                  onChange={(e) => setInviteEmail(e.target.value)}
+                  style={{ flex: 1, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '7px 10px', fontSize: 13 }}
+                />
+                <select
+                  value={inviteRole}
+                  onChange={(e) => setInviteRole(e.target.value)}
+                  style={{ border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '7px 8px', fontSize: 13 }}
+                >
+                  <option value="viewer">Viewer</option>
+                  <option value="editor">Editor</option>
+                  <option value="power">Power user</option>
+                  <option value="admin">Admin</option>
+                </select>
+                <button
+                  onClick={sendInvite}
+                  disabled={!inviteEmail.trim()}
+                  style={{ display: 'flex', alignItems: 'center', gap: 6, background: COLORS.jade, color: '#fff', border: 'none', borderRadius: 6, padding: '7px 12px', fontSize: 13, cursor: inviteEmail.trim() ? 'pointer' : 'default', opacity: inviteEmail.trim() ? 1 : 0.6 }}
+                >
+                  Invite
+                </button>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-2">
+              {members.map((m) => (
+                <div key={m.userId} style={{ border: `1px solid ${COLORS.border}`, borderRadius: 8 }} className="flex items-center justify-between px-3 py-2">
+                  <div>
+                    <div className="text-sm font-medium">{m.email}</div>
+                    <div style={{ color: COLORS.textMuted }} className="text-xs">joined {new Date(m.joinedAt).toLocaleDateString()}</div>
+                  </div>
+                  {canManageMembers ? (
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={m.role}
+                        onChange={(e) => changeMemberRole(m.userId, e.target.value)}
+                        style={{ border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '4px 6px', fontSize: 12 }}
+                      >
+                        <option value="viewer">Viewer</option>
+                        <option value="editor">Editor</option>
+                        <option value="power">Power user</option>
+                        <option value="admin">Admin</option>
+                      </select>
+                      <button onClick={() => removeMember(m.userId)} title="Remove from workspace" style={{ background: COLORS.brickSoft, color: COLORS.brick, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  ) : (
+                    <span style={{ background: COLORS.surfaceAlt, borderRadius: 4, padding: '2px 8px', fontSize: 11.5, textTransform: 'capitalize', color: COLORS.textMuted }}>{m.role}</span>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}
@@ -760,17 +936,32 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
 /* ----------------------------------------------------------------------
    AUTH SCREEN — login / signup / forgot password / reset password
 ---------------------------------------------------------------------- */
-function AuthScreen({ onAuthenticated, initialResetToken }) {
-  const [mode, setMode] = useState(initialResetToken ? 'reset' : 'login'); // login | signup | forgot | reset
+function AuthScreen({ onAuthenticated, initialResetToken, initialInviteToken }) {
+  const [mode, setMode] = useState(initialResetToken ? 'reset' : (initialInviteToken ? 'signup' : 'login')); // login | signup | forgot | reset
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [workspaceName, setWorkspaceName] = useState('');
   const [resetToken] = useState(initialResetToken || '');
+  const [inviteToken] = useState(initialInviteToken || '');
+  const [inviteInfo, setInviteInfo] = useState(null);
+  const [inviteError, setInviteError] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+
+  useEffect(() => {
+    if (!inviteToken) return;
+    fetch(`${API_BASE}/invites/${inviteToken}`)
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) { setInviteError(data.error || 'This invite is no longer valid.'); return; }
+        setInviteInfo(data);
+        setEmail(data.email);
+      })
+      .catch(() => setInviteError('Could not check this invite — it may be no longer valid.'));
+  }, [inviteToken]);
 
   const inputStyle = {
     width: '100%', border: `1px solid ${COLORS.chromeBorder}`, background: COLORS.bgChrome2, color: COLORS.textOnDark,
@@ -790,11 +981,21 @@ function AuthScreen({ onAuthenticated, initialResetToken }) {
     try {
       if (mode === 'login' || mode === 'signup') {
         const path = mode === 'login' ? 'login' : 'signup';
-        const body = mode === 'login' ? { email, password } : { email, password, workspaceName };
+        const body = mode === 'login' ? { email, password } : { email, password, workspaceName, inviteToken: inviteInfo ? inviteToken : undefined };
         const r = await fetch(`${API_BASE}/auth/${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const data = await r.json();
         if (!r.ok) throw new Error(data.error || 'something went wrong');
-        onAuthenticated(data);
+
+        // Logging in doesn't auto-join an invited workspace the way signup does —
+        // accept it explicitly with the fresh login token before continuing.
+        if (mode === 'login' && inviteInfo) {
+          const acceptR = await fetch(`${API_BASE}/invites/${inviteToken}/accept`, { method: 'POST', headers: { Authorization: `Bearer ${data.token}` } });
+          const acceptData = await acceptR.json();
+          if (!acceptR.ok) throw new Error(acceptData.error || 'Could not join that workspace.');
+          onAuthenticated(acceptData);
+        } else {
+          onAuthenticated(data);
+        }
       } else if (mode === 'forgot') {
         const r = await fetch(`${API_BASE}/auth/forgot-password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
         if (!r.ok) throw new Error('something went wrong');
@@ -826,11 +1027,17 @@ function AuthScreen({ onAuthenticated, initialResetToken }) {
           {mode === 'reset' && 'Choose a new password'}
         </div>
 
+        {inviteInfo && (
+          <div style={{ background: COLORS.violetSoft, color: COLORS.violet, borderRadius: 6, padding: '8px 10px', fontSize: 12.5, marginBottom: 12 }}>
+            You've been invited to <b>{inviteInfo.workspaceName}</b> as a <b>{inviteInfo.role}</b>. Sign up, or log in if you already have an account, using {inviteInfo.email}.
+          </div>
+        )}
+        {inviteError && <div style={{ background: COLORS.brickSoft, color: COLORS.brick, borderRadius: 6, padding: '8px 10px', fontSize: 12.5, marginBottom: 12 }}>{inviteError}</div>}
         {notice && <div style={{ background: COLORS.jadeSoft, color: COLORS.jade, borderRadius: 6, padding: '8px 10px', fontSize: 12.5, marginBottom: 12 }}>{notice}</div>}
         {error && <div style={{ background: COLORS.brickSoft, color: COLORS.brick, borderRadius: 6, padding: '8px 10px', fontSize: 12.5, marginBottom: 12 }}>{error}</div>}
 
         <form onSubmit={submit}>
-          {mode === 'signup' && (
+          {mode === 'signup' && !inviteInfo && (
             <>
               <label style={labelStyle}>Workspace name (optional)</label>
               <input style={inputStyle} type="text" placeholder="Acme Inc." value={workspaceName} onChange={(e) => setWorkspaceName(e.target.value)} />
@@ -840,7 +1047,11 @@ function AuthScreen({ onAuthenticated, initialResetToken }) {
           {mode !== 'reset' && (
             <>
               <label style={labelStyle}>Email</label>
-              <input style={inputStyle} type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@company.com" />
+              <input
+                style={{ ...inputStyle, opacity: inviteInfo ? 0.6 : 1 }}
+                type="email" required value={email} onChange={(e) => setEmail(e.target.value)}
+                placeholder="you@company.com" disabled={!!inviteInfo}
+              />
             </>
           )}
 
@@ -914,13 +1125,14 @@ export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem('rosebud_token'));
   const [workspaceName, setWorkspaceName] = useState(() => localStorage.getItem('rosebud_workspace_name') || '');
   const [resetToken] = useState(() => new URLSearchParams(window.location.search).get('resetToken') || '');
+  const [inviteToken] = useState(() => new URLSearchParams(window.location.search).get('inviteToken') || '');
 
   function handleAuthenticated({ token: t, workspace }) {
     localStorage.setItem('rosebud_token', t);
     localStorage.setItem('rosebud_workspace_name', workspace.name);
     setToken(t);
     setWorkspaceName(workspace.name);
-    if (resetToken) window.history.replaceState({}, '', window.location.pathname);
+    if (resetToken || inviteToken) window.history.replaceState({}, '', window.location.pathname);
   }
   function handleLogout() {
     localStorage.removeItem('rosebud_token');
@@ -929,7 +1141,7 @@ export default function App() {
   }
 
   if (!token) {
-    return <AuthScreen onAuthenticated={handleAuthenticated} initialResetToken={resetToken} />;
+    return <AuthScreen onAuthenticated={handleAuthenticated} initialResetToken={resetToken} initialInviteToken={inviteToken} />;
   }
-  return <Workspace token={token} workspaceName={workspaceName} onLogout={handleLogout} onAuthError={handleLogout} />;
+  return <Workspace token={token} workspaceName={workspaceName} onLogout={handleLogout} onAuthError={handleLogout} onSwitchWorkspace={handleAuthenticated} />;
 }
