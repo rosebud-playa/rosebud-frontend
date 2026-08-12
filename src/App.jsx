@@ -1022,7 +1022,7 @@ function AuthScreen({ onAuthenticated, initialResetToken, initialInviteToken }) 
         <div style={{ fontFamily: "'Space Grotesk', sans-serif", color: COLORS.textOnDark }} className="text-2xl font-bold tracking-tight mb-1">Rosebud</div>
         <div style={{ color: COLORS.textOnDarkMuted }} className="text-xs mb-6">
           {mode === 'login' && 'Log in to your workspace'}
-          {mode === 'signup' && 'Create your workspace'}
+          {mode === 'signup' && (inviteInfo ? `Join ${inviteInfo.workspaceName}` : 'Create your workspace')}
           {mode === 'forgot' && 'Reset your password'}
           {mode === 'reset' && 'Choose a new password'}
         </div>
@@ -1098,14 +1098,14 @@ function AuthScreen({ onAuthenticated, initialResetToken, initialInviteToken }) 
           )}
 
           <button type="submit" style={buttonStyle} disabled={busy}>
-            {busy ? 'Please wait…' : { login: 'Log in', signup: 'Create workspace', forgot: 'Send reset link', reset: 'Update password' }[mode]}
+            {busy ? 'Please wait…' : { login: 'Log in', signup: inviteInfo ? 'Join workspace' : 'Create workspace', forgot: 'Send reset link', reset: 'Update password' }[mode]}
           </button>
         </form>
 
         <div style={{ marginTop: 16, display: 'flex', justifyContent: 'space-between', fontSize: 12.5 }}>
           {mode === 'login' && (
             <>
-              <button onClick={() => { setMode('signup'); setError(''); setNotice(''); }} style={{ background: 'none', border: 'none', color: COLORS.textOnDarkMuted, cursor: 'pointer' }}>Create a workspace</button>
+              <button onClick={() => { setMode('signup'); setError(''); setNotice(''); }} style={{ background: 'none', border: 'none', color: COLORS.textOnDarkMuted, cursor: 'pointer' }}>{inviteInfo ? 'Sign up to join' : 'Create a workspace'}</button>
               <button onClick={() => { setMode('forgot'); setError(''); setNotice(''); }} style={{ background: 'none', border: 'none', color: COLORS.textOnDarkMuted, cursor: 'pointer' }}>Forgot password?</button>
             </>
           )}
@@ -1119,20 +1119,90 @@ function AuthScreen({ onAuthenticated, initialResetToken, initialInviteToken }) 
 }
 
 /* ----------------------------------------------------------------------
-   APP  — owns the auth token, renders AuthScreen or Workspace
+   INVITE GATE — handles a ?inviteToken= link when the user is already
+   logged into some account, so the invite is never silently ignored.
+---------------------------------------------------------------------- */
+function InviteGate({ currentToken, inviteToken, onAuthenticated, onLogout, onDismiss }) {
+  const [inviteInfo, setInviteInfo] = useState(null);
+  const [inviteError, setInviteError] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/invites/${inviteToken}`)
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => { if (!ok) setInviteError(data.error || 'This invite is no longer valid.'); else setInviteInfo(data); })
+      .catch(() => setInviteError('Could not check this invite — it may be no longer valid.'));
+  }, [inviteToken]);
+
+  // Not logged in at all — the normal auth screen already handles invites end to end.
+  if (!currentToken) {
+    return <AuthScreen onAuthenticated={onAuthenticated} initialResetToken="" initialInviteToken={inviteToken} />;
+  }
+
+  function acceptWithCurrentAccount() {
+    setBusy(true);
+    setActionError('');
+    fetch(`${API_BASE}/invites/${inviteToken}/accept`, { method: 'POST', headers: { Authorization: `Bearer ${currentToken}` } })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) { setActionError(data.error || 'Could not accept this invite.'); setBusy(false); return; }
+        onAuthenticated(data);
+      })
+      .catch(() => { setActionError('Could not accept this invite.'); setBusy(false); });
+  }
+
+  const btnPrimary = { width: '100%', background: COLORS.jade, color: '#fff', border: 'none', borderRadius: 8, padding: '11px 12px', fontSize: 14, fontWeight: 600, cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.7 : 1, marginBottom: 10 };
+  const btnSecondary = { width: '100%', background: 'none', color: COLORS.textOnDarkMuted, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 8, padding: '10px 12px', fontSize: 13, cursor: 'pointer', marginBottom: 10 };
+
+  return (
+    <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", background: COLORS.bgChrome, minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+      <div style={{ width: 380, background: COLORS.bgChrome2, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 12, padding: 28 }}>
+        <div style={{ fontFamily: "'Space Grotesk', sans-serif", color: COLORS.textOnDark }} className="text-2xl font-bold tracking-tight mb-1">Rosebud</div>
+        <div style={{ color: COLORS.textOnDarkMuted }} className="text-xs mb-5">You're already logged in — here's what to do with this invite.</div>
+
+        {inviteError && <div style={{ background: COLORS.brickSoft, color: COLORS.brick, borderRadius: 6, padding: '8px 10px', fontSize: 12.5, marginBottom: 12 }}>{inviteError}</div>}
+        {actionError && <div style={{ background: COLORS.brickSoft, color: COLORS.brick, borderRadius: 6, padding: '8px 10px', fontSize: 12.5, marginBottom: 12 }}>{actionError}</div>}
+
+        {inviteInfo && (
+          <>
+            <div style={{ color: COLORS.textOnDark }} className="text-sm mb-5">
+              You've been invited to <b>{inviteInfo.workspaceName}</b> as a <b>{inviteInfo.role}</b>, sent to <b>{inviteInfo.email}</b>.
+            </div>
+            <button onClick={acceptWithCurrentAccount} disabled={busy} style={btnPrimary}>
+              {busy ? 'Please wait…' : 'Accept with my current account'}
+            </button>
+            <button onClick={onLogout} style={btnSecondary}>Log out to use a different account</button>
+          </>
+        )}
+        <button onClick={onDismiss} style={{ width: '100%', background: 'none', color: COLORS.textOnDarkMuted, border: 'none', fontSize: 12.5, cursor: 'pointer' }}>
+          Skip and go to my workspace
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------------------
+   APP  — owns the auth token, renders InviteGate, AuthScreen, or Workspace
 ---------------------------------------------------------------------- */
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem('rosebud_token'));
   const [workspaceName, setWorkspaceName] = useState(() => localStorage.getItem('rosebud_workspace_name') || '');
   const [resetToken] = useState(() => new URLSearchParams(window.location.search).get('resetToken') || '');
-  const [inviteToken] = useState(() => new URLSearchParams(window.location.search).get('inviteToken') || '');
+  const [inviteToken, setInviteToken] = useState(() => new URLSearchParams(window.location.search).get('inviteToken') || '');
 
+  function clearInviteFromUrl() {
+    setInviteToken('');
+    window.history.replaceState({}, '', window.location.pathname);
+  }
   function handleAuthenticated({ token: t, workspace }) {
     localStorage.setItem('rosebud_token', t);
     localStorage.setItem('rosebud_workspace_name', workspace.name);
     setToken(t);
     setWorkspaceName(workspace.name);
     if (resetToken || inviteToken) window.history.replaceState({}, '', window.location.pathname);
+    setInviteToken('');
   }
   function handleLogout() {
     localStorage.removeItem('rosebud_token');
@@ -1140,8 +1210,14 @@ export default function App() {
     setToken(null);
   }
 
+  // An invite link always takes priority, even for an already-logged-in user —
+  // otherwise the invite gets silently ignored in favor of whatever account
+  // happens to already be signed in on this browser.
+  if (inviteToken) {
+    return <InviteGate currentToken={token} inviteToken={inviteToken} onAuthenticated={handleAuthenticated} onLogout={handleLogout} onDismiss={clearInviteFromUrl} />;
+  }
   if (!token) {
-    return <AuthScreen onAuthenticated={handleAuthenticated} initialResetToken={resetToken} initialInviteToken={inviteToken} />;
+    return <AuthScreen onAuthenticated={handleAuthenticated} initialResetToken={resetToken} />;
   }
   return <Workspace token={token} workspaceName={workspaceName} onLogout={handleLogout} onAuthError={handleLogout} onSwitchWorkspace={handleAuthenticated} />;
 }
