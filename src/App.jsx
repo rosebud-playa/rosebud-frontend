@@ -51,6 +51,21 @@ const ENTITIES = [
 ];
 const ENTITY_OPTIONS = [{ id: 'company', name: 'Company (Consolidated)' }, ...ENTITIES];
 
+// Product hierarchy: Category -> Product. Only Product Revenue (and its two
+// drivers, Units Sold / Unit Price) carry this dimension — every other line
+// item is entity-only, matching the backend's model.
+const PRODUCT_CATEGORIES = [
+  { id: 'hardware', name: 'Hardware' },
+  { id: 'software', name: 'Software' },
+];
+const PRODUCTS = [
+  { id: 'core_widget', name: 'Core Widget', category: 'hardware' },
+  { id: 'widget_mini', name: 'Widget Mini', category: 'hardware' },
+  { id: 'platform_license', name: 'Platform License', category: 'software' },
+  { id: 'addon_modules', name: 'Add-on Modules', category: 'software' },
+];
+const PRODUCT_DIMENSIONED_ACCOUNTS = ['units_sold', 'unit_price'];
+
 // Account hierarchy. type: 'rollup' (sums structural children), 'formula' (computed from drivers),
 // 'input' (editable leaf). isDriver rows are formula inputs shown nested under their formula parent.
 const ACCOUNTS = [
@@ -80,29 +95,52 @@ function topAncestor(id) {
   while (a && a.parentId) a = ACCOUNTS_BY_ID[a.parentId];
   return a ? a.id : id;
 }
-function computeFormula(accountId, get) {
-  if (accountId === 'product_revenue') return get('units_sold') * get('unit_price');
+function computeFormula(accountId, get, getForProduct, product) {
+  if (accountId === 'product_revenue') {
+    if (product === 'all') {
+      return PRODUCTS.reduce((s, p) => s + getForProduct('units_sold', p.id) * getForProduct('unit_price', p.id), 0);
+    }
+    return getForProduct('units_sold', product) * getForProduct('unit_price', product);
+  }
   if (accountId === 'personnel') return get('headcount') * get('avg_salary');
   return 0;
 }
-function getValueAt(data, entityId, accountId, month) {
+// `product` selects which product's Units Sold / Unit Price / Product Revenue to
+// show — it has no effect on any other line, and rollups (Revenue, Expenses) and
+// the Company-consolidated view always sum every product in full regardless of
+// what's selected, so totals are never a partial/misleading slice.
+function getValueAt(data, entityId, accountId, month, product) {
+  const prod = product || 'all';
   if (entityId === 'company') {
-    return ENTITIES.reduce((s, e) => s + getValueAt(data, e.id, accountId, month), 0);
+    return ENTITIES.reduce((s, e) => s + getValueAt(data, e.id, accountId, month, prod), 0);
   }
   const acc = ACCOUNTS_BY_ID[accountId];
   if (!acc) return 0;
   if (acc.type === 'rollup') {
-    return childrenOf(accountId).reduce((s, c) => s + getValueAt(data, entityId, c.id, month), 0);
+    // Rollups always consolidate every product — the selector never partially filters a total.
+    return childrenOf(accountId).reduce((s, c) => s + getValueAt(data, entityId, c.id, month, 'all'), 0);
   }
   if (acc.type === 'formula') {
-    return computeFormula(accountId, (depId) => getValueAt(data, entityId, depId, month));
+    return computeFormula(
+      accountId,
+      (depId) => getValueAt(data, entityId, depId, month, 'all'),
+      (depId, p) => getValueAt(data, entityId, depId, month, p),
+      prod,
+    );
   }
-  return (data[entityId] && data[entityId][accountId] && data[entityId][accountId][month]) || 0;
+  if (PRODUCT_DIMENSIONED_ACCOUNTS.includes(accountId)) {
+    const byProduct = (data[entityId] && data[entityId][accountId]) || {};
+    if (prod === 'all') {
+      return PRODUCTS.reduce((s, p) => s + ((byProduct[p.id] && byProduct[p.id][month]) || 0), 0);
+    }
+    return (byProduct[prod] && byProduct[prod][month]) || 0;
+  }
+  return (data[entityId] && data[entityId][accountId] && data[entityId][accountId].none && data[entityId][accountId].none[month]) || 0;
 }
-function getPeriodValue(data, entityId, accountId, period) {
-  if (MONTHS.includes(period)) return getValueAt(data, entityId, accountId, period);
-  if (period === 'FY') return MONTHS.reduce((s, m) => s + getPeriodValue(data, entityId, accountId, m), 0);
-  return (QUARTER_MONTHS[period] || []).reduce((s, m) => s + getPeriodValue(data, entityId, accountId, m), 0);
+function getPeriodValue(data, entityId, accountId, period, product) {
+  if (MONTHS.includes(period)) return getValueAt(data, entityId, accountId, period, product);
+  if (period === 'FY') return MONTHS.reduce((s, m) => s + getPeriodValue(data, entityId, accountId, m, product), 0);
+  return (QUARTER_MONTHS[period] || []).reduce((s, m) => s + getPeriodValue(data, entityId, accountId, m, product), 0);
 }
 
 /* ----------------------------------------------------------------------
@@ -156,6 +194,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
   const [saveStatus, setSaveStatus] = useState('idle'); // idle | saving | saved | error
   const [currentScenario, setCurrentScenario] = useState('Budget');
   const [currentEntity, setCurrentEntity] = useState('company');
+  const [currentProduct, setCurrentProduct] = useState('all');
   const [granularity, setGranularity] = useState('Monthly');
   const [expanded, setExpanded] = useState(() => new Set(['revenue', 'expenses']));
   const [compareMode, setCompareMode] = useState(false);
@@ -210,13 +249,16 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
   function updateValue(accountId, month, raw) {
     const num = raw === '' ? 0 : parseFloat(raw);
     const value = isNaN(num) ? 0 : num;
+    const productKey = PRODUCT_DIMENSIONED_ACCOUNTS.includes(accountId) ? currentProduct : 'none';
 
     // Optimistic local update so typing feels instant.
     setValues((prev) => {
       const next = { ...prev };
       const scen = { ...next[currentScenario] };
       const ent = { ...scen[currentEntity] };
-      ent[accountId] = { ...ent[accountId], [month]: value };
+      const accData = { ...ent[accountId] };
+      accData[productKey] = { ...accData[productKey], [month]: value };
+      ent[accountId] = accData;
       scen[currentEntity] = ent;
       next[currentScenario] = scen;
       return next;
@@ -226,7 +268,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
     fetch(`${API_BASE}/cell`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ scenario: currentScenario, entity: currentEntity, account: accountId, month, value }),
+      body: JSON.stringify({ scenario: currentScenario, entity: currentEntity, account: accountId, month, value, product: productKey }),
     })
       .then((r) => { if (!r.ok) throw new Error('save failed'); setSaveStatus('saved'); })
       .catch(() => setSaveStatus('error'));
@@ -370,6 +412,21 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
 
             <select
               className="lw-select"
+              value={currentProduct}
+              onChange={(e) => setCurrentProduct(e.target.value)}
+              title="Filters Product Revenue, Units Sold, and Unit Price only — every other line always shows the full total."
+              style={{ background: COLORS.bgChrome2, color: COLORS.textOnDark, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 6, padding: '6px 10px', fontSize: 13 }}
+            >
+              <option value="all">All Products</option>
+              {PRODUCT_CATEGORIES.map((cat) => (
+                <optgroup key={cat.id} label={cat.name}>
+                  {PRODUCTS.filter((p) => p.category === cat.id).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </optgroup>
+              ))}
+            </select>
+
+            <select
+              className="lw-select"
               value={currentScenario}
               onChange={(e) => setCurrentScenario(e.target.value)}
               style={{ background: COLORS.bgChrome2, color: COLORS.textOnDark, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 6, padding: '6px 10px', fontSize: 13 }}
@@ -480,9 +537,11 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
 
       {/* ---------------- Grid ---------------- */}
       <div className="px-6 pt-4 pb-2">
-        {!compareMode && !canEdit && (
+        {!compareMode && (!canEdit || currentProduct === 'all') && (
           <div style={{ color: COLORS.textMuted }} className="text-xs mb-2">
-            {currentEntity === 'company' ? 'Select a specific entity to edit inputs.' : 'Switch to Monthly view to edit inputs.'}
+            {currentEntity === 'company' && 'Select a specific entity to edit inputs. '}
+            {granularity !== 'Monthly' && 'Switch to Monthly view to edit inputs. '}
+            {currentProduct === 'all' && 'Select a specific product to edit Units Sold or Unit Price.'}
           </div>
         )}
         <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
@@ -541,15 +600,17 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
                           </div>
                         </td>
                         {columns.map((col) => {
-                          const val = getPeriodValue(liveData, currentEntity, row.id, col);
-                          const editableHere = canEdit && row.type === 'input' && MONTHS.includes(col);
+                          const val = getPeriodValue(liveData, currentEntity, row.id, col, currentProduct);
+                          const isProductAccount = PRODUCT_DIMENSIONED_ACCOUNTS.includes(row.id);
+                          const productKey = isProductAccount ? currentProduct : 'none';
+                          const editableHere = canEdit && row.type === 'input' && MONTHS.includes(col) && (!isProductAccount || currentProduct !== 'all');
                           return (
                             <td key={col} style={{ background: col === 'FY' ? '#EDEFF3' : bg }} className="px-3 py-1.5 text-right">
                               {editableHere ? (
                                 <input
                                   type="number"
                                   className="lw-num lw-cell-input"
-                                  value={liveData[currentEntity]?.[row.id]?.[col] ?? 0}
+                                  value={liveData[currentEntity]?.[row.id]?.[productKey]?.[col] ?? 0}
                                   onChange={(e) => updateValue(row.id, col, e.target.value)}
                                 />
                               ) : (
@@ -563,8 +624,8 @@ function Workspace({ token, workspaceName, onLogout, onAuthError }) {
                   }
 
                   // Compare mode row
-                  const valA = getPeriodValue(liveData, currentEntity, row.id, comparePeriod);
-                  const valB = getPeriodValue(compareData, currentEntity, row.id, comparePeriod);
+                  const valA = getPeriodValue(liveData, currentEntity, row.id, comparePeriod, currentProduct);
+                  const valB = getPeriodValue(compareData, currentEntity, row.id, comparePeriod, currentProduct);
                   const diff = valA - valB;
                   const pct = valB !== 0 ? (diff / Math.abs(valB)) * 100 : (valA === 0 ? 0 : 100);
                   const favorable = topAncestor(row.id) === 'expenses' ? diff <= 0 : diff >= 0;
