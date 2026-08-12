@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import {
-  ChevronRight, ChevronDown, Save, RotateCcw, Trash2, X, ArrowLeftRight, History,
+  ChevronRight, ChevronDown, Save, RotateCcw, Trash2, X, ArrowLeftRight, History, Eye, EyeOff,
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
@@ -707,6 +707,7 @@ function AuthScreen({ onAuthenticated, initialResetToken }) {
   const [resetToken] = useState(initialResetToken || '');
   const [newPassword, setNewPassword] = useState('');
   const [busy, setBusy] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
@@ -785,14 +786,42 @@ function AuthScreen({ onAuthenticated, initialResetToken }) {
           {(mode === 'login' || mode === 'signup') && (
             <>
               <label style={labelStyle}>Password</label>
-              <input style={inputStyle} type="password" required minLength={8} value={password} onChange={(e) => setPassword(e.target.value)} placeholder={mode === 'signup' ? 'At least 8 characters' : ''} />
+              <div style={{ position: 'relative', marginBottom: 12 }}>
+                <input
+                  style={{ ...inputStyle, marginBottom: 0, paddingRight: 40 }}
+                  type={showPassword ? 'text' : 'password'}
+                  required minLength={8} value={password} onChange={(e) => setPassword(e.target.value)}
+                  placeholder={mode === 'signup' ? 'At least 8 characters' : ''}
+                />
+                <button
+                  type="button" onClick={() => setShowPassword((s) => !s)} tabIndex={-1}
+                  style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', color: COLORS.textOnDarkMuted, cursor: 'pointer', display: 'flex', padding: 0 }}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                >
+                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
             </>
           )}
 
           {mode === 'reset' && (
             <>
               <label style={labelStyle}>New password</label>
-              <input style={inputStyle} type="password" required minLength={8} value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="At least 8 characters" />
+              <div style={{ position: 'relative', marginBottom: 12 }}>
+                <input
+                  style={{ ...inputStyle, marginBottom: 0, paddingRight: 40 }}
+                  type={showPassword ? 'text' : 'password'}
+                  required minLength={8} value={newPassword} onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="At least 8 characters"
+                />
+                <button
+                  type="button" onClick={() => setShowPassword((s) => !s)} tabIndex={-1}
+                  style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', color: COLORS.textOnDarkMuted, cursor: 'pointer', display: 'flex', padding: 0 }}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                >
+                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
             </>
           )}
 
