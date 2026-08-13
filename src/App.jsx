@@ -703,6 +703,8 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
         )}
       </div>
 
+      {location.pathname === '/' && (
+      <>
       {/* ---------------- KPI strip ---------------- */}
       <div className="px-6 pt-5 grid grid-cols-3 gap-4">
         {[
@@ -902,6 +904,8 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
           Rail colors: <span style={{ color: COLORS.jade }}>■</span> rollup &nbsp; <span style={{ color: COLORS.violet }}>■</span> formula &nbsp; <span style={{ color: COLORS.amber }}>■</span> driver input &nbsp; <span style={{ color: COLORS.border }}>■</span> input. Edits save to the shared workspace on the budget server as you type.
         </div>
       </div>
+      </>
+      )}
 
       {/* ---------------- Versions drawer ---------------- */}
       {showVersions && (
