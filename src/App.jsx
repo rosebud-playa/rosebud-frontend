@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect } from 'react';
+import { BrowserRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
 import {
   ChevronRight, ChevronDown, Save, RotateCcw, Trash2, X, ArrowLeftRight, History, Eye, EyeOff, Download, Archive,
 } from 'lucide-react';
@@ -199,6 +200,12 @@ function rowNameStyle(account) {
    APP
 ---------------------------------------------------------------------- */
 function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorkspace }) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const showVersions = location.pathname === '/versions';
+  const showMembers = location.pathname === '/members';
+  const showBackups = location.pathname === '/backups';
+
   const [values, setValues] = useState({});
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [loadError, setLoadError] = useState(null);
@@ -212,21 +219,19 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const [compareTarget, setCompareTarget] = useState('Actual');
   const [comparePeriod, setComparePeriod] = useState('FY');
   const [versions, setVersions] = useState([]);
-  const [showVersions, setShowVersions] = useState(false);
   const [versionLabel, setVersionLabel] = useState('');
   const [role, setRole] = useState('viewer');
   const [myWorkspaces, setMyWorkspaces] = useState([]);
-  const [showMembers, setShowMembers] = useState(false);
   const [members, setMembers] = useState([]);
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState('editor');
   const [membersError, setMembersError] = useState('');
   const [lastInviteLink, setLastInviteLink] = useState('');
-  const [showBackups, setShowBackups] = useState(false);
   const [backups, setBackups] = useState([]);
   const [backupLabel, setBackupLabel] = useState('');
   const [backupsError, setBackupsError] = useState('');
   const [creatingBackup, setCreatingBackup] = useState(false);
+  const [confirmingRestoreId, setConfirmingRestoreId] = useState(null);
 
   useEffect(() => {
     fetch(`${API_BASE}/workspace`, { headers: { Authorization: `Bearer ${token}` } })
@@ -368,6 +373,18 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       .then(({ ok, data }) => { if (!ok) setBackupsError(data.error || 'Could not delete backup.'); else loadBackups(); })
       .catch(() => setBackupsError('Could not delete backup.'));
   }
+  function restoreBackup(id) {
+    if (confirmingRestoreId !== id) { setConfirmingRestoreId(id); return; }
+    setConfirmingRestoreId(null);
+    setBackupsError('');
+    fetch(`${API_BASE}/workspace/backups/${id}/restore`, { method: 'PUT', headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) { setBackupsError(data.error || 'Could not restore backup.'); return; }
+        setValues(data.values);
+      })
+      .catch(() => setBackupsError('Could not restore backup.'));
+  }
 
   const liveData = values[currentScenario];
 
@@ -467,7 +484,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   function compareWithVersion(v) {
     setCompareMode(true);
     setCompareTarget(`v:${v.id}`);
-    setShowVersions(false);
+    navigate('/');
   }
 
   if (loadError) {
@@ -553,7 +570,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
               </select>
             )}
             <button
-              onClick={() => { setShowMembers((s) => !s); if (!showMembers) loadMembers(); }}
+              onClick={() => { if (showMembers) navigate('/'); else { navigate('/members'); loadMembers(); } }}
               style={{
                 display: 'flex', alignItems: 'center', gap: 6, padding: '5px 10px', borderRadius: 6, fontSize: 12.5,
                 background: showMembers ? COLORS.violet : 'none', color: showMembers ? '#fff' : COLORS.textOnDarkMuted,
@@ -564,7 +581,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             </button>
             {canManageBackups && (
               <button
-                onClick={() => { setShowBackups((s) => !s); if (!showBackups) loadBackups(); }}
+                onClick={() => { if (showBackups) navigate('/'); else { navigate('/backups'); loadBackups(); } }}
                 style={{
                   display: 'flex', alignItems: 'center', gap: 6, padding: '5px 10px', borderRadius: 6, fontSize: 12.5,
                   background: showBackups ? COLORS.violet : 'none', color: showBackups ? '#fff' : COLORS.textOnDarkMuted,
@@ -648,7 +665,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             </button>
 
             <button
-              onClick={() => setShowVersions((s) => !s)}
+              onClick={() => navigate(showVersions ? '/' : '/versions')}
               style={{
                 display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', borderRadius: 6, fontSize: 13,
                 background: showVersions ? COLORS.amber : COLORS.bgChrome2, color: '#fff', border: `1px solid ${showVersions ? COLORS.amber : COLORS.chromeBorder}`, cursor: 'pointer',
@@ -892,7 +909,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
           <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg p-4">
             <div className="flex items-center justify-between mb-3">
               <div className="font-semibold text-sm">Saved versions</div>
-              <button onClick={() => setShowVersions(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted }}><X size={16} /></button>
+              <button onClick={() => navigate('/')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted }}><X size={16} /></button>
             </div>
 
             {canEditData && (
@@ -961,7 +978,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                     <Download size={13} /> Download Backup
                   </button>
                 )}
-                <button onClick={() => setShowMembers(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted }}><X size={16} /></button>
+                <button onClick={() => navigate('/')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted }}><X size={16} /></button>
               </div>
             </div>
 
@@ -1043,7 +1060,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
           <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg p-4">
             <div className="flex items-center justify-between mb-3">
               <div className="font-semibold text-sm">Workspace backups</div>
-              <button onClick={() => setShowBackups(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted }}><X size={16} /></button>
+              <button onClick={() => navigate('/')} style={{ background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted }}><X size={16} /></button>
             </div>
             <div style={{ color: COLORS.textMuted }} className="text-xs mb-4">
               A backup captures every scenario, every product/entity/month value, every saved version, and the member list at this moment. Stored here so anyone with Power or Admin access can come back and download it later.
@@ -1073,18 +1090,36 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             ) : (
               <div className="flex flex-col gap-2">
                 {backups.map((b) => (
-                  <div key={b.id} style={{ border: `1px solid ${COLORS.border}`, borderRadius: 8 }} className="flex items-center justify-between px-3 py-2">
+                  <div key={b.id} style={{ border: `1px solid ${confirmingRestoreId === b.id ? COLORS.amber : COLORS.border}`, borderRadius: 8 }} className="flex items-center justify-between px-3 py-2">
                     <div>
                       <div className="text-sm font-medium">{b.label}</div>
-                      <div style={{ color: COLORS.textMuted }} className="text-xs">by {b.createdBy} · {new Date(b.createdAt).toLocaleString()}</div>
+                      <div style={{ color: confirmingRestoreId === b.id ? COLORS.amber : COLORS.textMuted }} className="text-xs">
+                        {confirmingRestoreId === b.id ? 'This overwrites current Budget/Forecast/Actual data with this backup. Saved versions and members are untouched.' : `by ${b.createdBy} · ${new Date(b.createdAt).toLocaleString()}`}
+                      </div>
                     </div>
                     <div className="flex items-center gap-1">
-                      <button onClick={() => downloadStoredBackup(b.id, b.label)} title="Download this backup" style={{ background: COLORS.jadeSoft, color: COLORS.jade, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
-                        <Download size={12} /> Download
-                      </button>
-                      <button onClick={() => deleteBackup(b.id)} title="Delete this backup" style={{ background: COLORS.brickSoft, color: COLORS.brick, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
-                        <Trash2 size={12} />
-                      </button>
+                      {confirmingRestoreId === b.id ? (
+                        <>
+                          <button onClick={() => restoreBackup(b.id)} style={{ background: COLORS.amber, color: '#fff', border: 'none', borderRadius: 6, padding: '5px 10px', cursor: 'pointer', fontSize: 12, fontWeight: 600 }}>
+                            Yes, restore
+                          </button>
+                          <button onClick={() => setConfirmingRestoreId(null)} style={{ background: 'none', color: COLORS.textMuted, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '5px 10px', cursor: 'pointer', fontSize: 12 }}>
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button onClick={() => downloadStoredBackup(b.id, b.label)} title="Download this backup" style={{ background: COLORS.jadeSoft, color: COLORS.jade, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+                            <Download size={12} /> Download
+                          </button>
+                          <button onClick={() => restoreBackup(b.id)} title="Restore this backup into the live workspace" style={{ background: COLORS.amberSoft, color: COLORS.amber, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+                            <RotateCcw size={12} /> Restore
+                          </button>
+                          <button onClick={() => deleteBackup(b.id)} title="Delete this backup" style={{ background: COLORS.brickSoft, color: COLORS.brick, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
+                            <Trash2 size={12} />
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -1383,5 +1418,19 @@ export default function App() {
   if (!token) {
     return <AuthScreen onAuthenticated={handleAuthenticated} initialResetToken={resetToken} />;
   }
-  return <Workspace token={token} workspaceName={workspaceName} onLogout={handleLogout} onAuthError={handleLogout} onSwitchWorkspace={handleAuthenticated} />;
+  // A single wildcard route keeps Workspace mounted continuously across "/",
+  // "/members", "/backups", and "/versions" — it reads the current path itself
+  // via useLocation(). Mapping each path to its own <Route> would cause React
+  // Router to unmount/remount Workspace on every panel switch, wiping local
+  // state (current entity/scenario selections, etc.) and re-fetching everything.
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route
+          path="/*"
+          element={<Workspace token={token} workspaceName={workspaceName} onLogout={handleLogout} onAuthError={handleLogout} onSwitchWorkspace={handleAuthenticated} />}
+        />
+      </Routes>
+    </BrowserRouter>
+  );
 }
