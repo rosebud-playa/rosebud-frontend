@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import {
-  ChevronRight, ChevronDown, Save, RotateCcw, Trash2, X, ArrowLeftRight, History, Eye, EyeOff, Download,
+  ChevronRight, ChevronDown, Save, RotateCcw, Trash2, X, ArrowLeftRight, History, Eye, EyeOff, Download, Archive,
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
@@ -222,6 +222,11 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const [inviteRole, setInviteRole] = useState('editor');
   const [membersError, setMembersError] = useState('');
   const [lastInviteLink, setLastInviteLink] = useState('');
+  const [showBackups, setShowBackups] = useState(false);
+  const [backups, setBackups] = useState([]);
+  const [backupLabel, setBackupLabel] = useState('');
+  const [backupsError, setBackupsError] = useState('');
+  const [creatingBackup, setCreatingBackup] = useState(false);
 
   useEffect(() => {
     fetch(`${API_BASE}/workspace`, { headers: { Authorization: `Bearer ${token}` } })
@@ -245,6 +250,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
 
   const canManageMembers = role === 'admin';
   const canEditData = role === 'editor' || role === 'power' || role === 'admin';
+  const canManageBackups = role === 'power' || role === 'admin';
   const myUserId = useMemo(() => decodeToken(token)?.userId, [token]);
 
   function loadMembers() {
@@ -298,24 +304,69 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       .then((data) => onSwitchWorkspace(data))
       .catch(() => setSaveStatus('error'));
   }
+  function triggerJsonDownload(data, filename) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
   function downloadBackup() {
     setMembersError('');
     fetch(`${API_BASE}/workspace/backup`, { headers: { Authorization: `Bearer ${token}` } })
       .then((r) => { if (!r.ok) throw new Error('Could not generate backup.'); return r.json(); })
       .then((backup) => {
-        const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
         const dateStamp = new Date().toISOString().slice(0, 10);
         const safeName = (workspaceName || 'rosebud').toLowerCase().replace(/[^a-z0-9]+/g, '-');
-        a.href = url;
-        a.download = `rosebud-backup-${safeName}-${dateStamp}.json`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        triggerJsonDownload(backup, `rosebud-backup-${safeName}-${dateStamp}.json`);
       })
       .catch(() => setMembersError('Could not download backup.'));
+  }
+
+  function loadBackups() {
+    fetch(`${API_BASE}/workspace/backups`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json())
+      .then((data) => setBackups(data.backups || []))
+      .catch(() => {});
+  }
+  function createBackup() {
+    setBackupsError('');
+    setCreatingBackup(true);
+    fetch(`${API_BASE}/workspace/backups`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ label: backupLabel.trim() }),
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        setCreatingBackup(false);
+        if (!ok) { setBackupsError(data.error || 'Could not create backup.'); return; }
+        setBackupLabel('');
+        loadBackups();
+      })
+      .catch(() => { setCreatingBackup(false); setBackupsError('Could not create backup.'); });
+  }
+  function downloadStoredBackup(id, label) {
+    setBackupsError('');
+    fetch(`${API_BASE}/workspace/backups/${id}`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => { if (!r.ok) throw new Error('Could not download backup.'); return r.json(); })
+      .then((backup) => {
+        const dateStamp = new Date().toISOString().slice(0, 10);
+        const safeName = (label || 'backup').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+        triggerJsonDownload(backup, `rosebud-${safeName}-${dateStamp}.json`);
+      })
+      .catch(() => setBackupsError('Could not download backup.'));
+  }
+  function deleteBackup(id) {
+    setBackupsError('');
+    fetch(`${API_BASE}/workspace/backups/${id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => { if (!ok) setBackupsError(data.error || 'Could not delete backup.'); else loadBackups(); })
+      .catch(() => setBackupsError('Could not delete backup.'));
   }
 
   const liveData = values[currentScenario];
@@ -511,6 +562,18 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             >
               Members
             </button>
+            {canManageBackups && (
+              <button
+                onClick={() => { setShowBackups((s) => !s); if (!showBackups) loadBackups(); }}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, padding: '5px 10px', borderRadius: 6, fontSize: 12.5,
+                  background: showBackups ? COLORS.violet : 'none', color: showBackups ? '#fff' : COLORS.textOnDarkMuted,
+                  border: `1px solid ${showBackups ? COLORS.violet : COLORS.chromeBorder}`, cursor: 'pointer',
+                }}
+              >
+                <Archive size={13} /> Backups {backups.length > 0 ? `(${backups.length})` : ''}
+              </button>
+            )}
             <div className="flex items-center gap-1.5 text-xs" style={{ color: saveStatus === 'error' ? COLORS.brick : COLORS.textOnDarkMuted }}>
               <span style={{
                 width: 6, height: 6, borderRadius: 6, display: 'inline-block',
@@ -890,7 +953,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             <div className="flex items-center justify-between mb-3">
               <div className="font-semibold text-sm">Workspace members</div>
               <div className="flex items-center gap-2">
-                {canManageMembers && (
+                {canManageBackups && (
                   <button
                     onClick={downloadBackup}
                     style={{ display: 'flex', alignItems: 'center', gap: 6, background: COLORS.surfaceAlt, color: COLORS.textDark, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '5px 10px', fontSize: 12, cursor: 'pointer' }}
@@ -970,6 +1033,63 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                 );
               })}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ---------------- Backups drawer ---------------- */}
+      {showBackups && canManageBackups && (
+        <div className="px-6 pb-6">
+          <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="font-semibold text-sm">Workspace backups</div>
+              <button onClick={() => setShowBackups(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted }}><X size={16} /></button>
+            </div>
+            <div style={{ color: COLORS.textMuted }} className="text-xs mb-4">
+              A backup captures every scenario, every product/entity/month value, every saved version, and the member list at this moment. Stored here so anyone with Power or Admin access can come back and download it later.
+            </div>
+
+            {backupsError && <div style={{ background: COLORS.brickSoft, color: COLORS.brick, borderRadius: 6, padding: '8px 10px', fontSize: 12.5, marginBottom: 12 }}>{backupsError}</div>}
+
+            <div className="flex items-center gap-2 mb-4">
+              <input
+                type="text"
+                placeholder='Label (e.g. "End of Q2")'
+                value={backupLabel}
+                onChange={(e) => setBackupLabel(e.target.value)}
+                style={{ flex: 1, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '7px 10px', fontSize: 13 }}
+              />
+              <button
+                onClick={createBackup}
+                disabled={creatingBackup}
+                style={{ display: 'flex', alignItems: 'center', gap: 6, background: COLORS.jade, color: '#fff', border: 'none', borderRadius: 6, padding: '7px 12px', fontSize: 13, cursor: creatingBackup ? 'default' : 'pointer', opacity: creatingBackup ? 0.7 : 1 }}
+              >
+                <Archive size={14} /> {creatingBackup ? 'Creating…' : 'Create Backup'}
+              </button>
+            </div>
+
+            {backups.length === 0 ? (
+              <div style={{ color: COLORS.textMuted }} className="text-xs">No backups saved yet. Create one before making a big change.</div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {backups.map((b) => (
+                  <div key={b.id} style={{ border: `1px solid ${COLORS.border}`, borderRadius: 8 }} className="flex items-center justify-between px-3 py-2">
+                    <div>
+                      <div className="text-sm font-medium">{b.label}</div>
+                      <div style={{ color: COLORS.textMuted }} className="text-xs">by {b.createdBy} · {new Date(b.createdAt).toLocaleString()}</div>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button onClick={() => downloadStoredBackup(b.id, b.label)} title="Download this backup" style={{ background: COLORS.jadeSoft, color: COLORS.jade, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+                        <Download size={12} /> Download
+                      </button>
+                      <button onClick={() => deleteBackup(b.id)} title="Delete this backup" style={{ background: COLORS.brickSoft, color: COLORS.brick, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
+                        <Trash2 size={12} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}
