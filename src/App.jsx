@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import {
-  ChevronRight, ChevronDown, Save, RotateCcw, Trash2, X, ArrowLeftRight, History, Eye, EyeOff,
+  ChevronRight, ChevronDown, Save, RotateCcw, Trash2, X, ArrowLeftRight, History, Eye, EyeOff, Download,
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
@@ -146,6 +146,17 @@ function getPeriodValue(data, entityId, accountId, period, product) {
 /* ----------------------------------------------------------------------
    FORMATTERS
 ---------------------------------------------------------------------- */
+// Reads the payload out of our own JWT for UI purposes only (e.g. "is this row
+// me?") — never used for authorization, which the backend always re-checks.
+function decodeToken(token) {
+  try {
+    const payload = token.split('.')[1];
+    return JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/')));
+  } catch {
+    return null;
+  }
+}
+
 function fmtMoney(v) {
   const r = Math.round(v);
   return `${r < 0 ? '-' : ''}$${Math.abs(r).toLocaleString()}`;
@@ -234,6 +245,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
 
   const canManageMembers = role === 'admin';
   const canEditData = role === 'editor' || role === 'power' || role === 'admin';
+  const myUserId = useMemo(() => decodeToken(token)?.userId, [token]);
 
   function loadMembers() {
     fetch(`${API_BASE}/workspace/members`, { headers: { Authorization: `Bearer ${token}` } })
@@ -285,6 +297,25 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       .then((r) => r.json())
       .then((data) => onSwitchWorkspace(data))
       .catch(() => setSaveStatus('error'));
+  }
+  function downloadBackup() {
+    setMembersError('');
+    fetch(`${API_BASE}/workspace/backup`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => { if (!r.ok) throw new Error('Could not generate backup.'); return r.json(); })
+      .then((backup) => {
+        const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const dateStamp = new Date().toISOString().slice(0, 10);
+        const safeName = (workspaceName || 'rosebud').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+        a.href = url;
+        a.download = `rosebud-backup-${safeName}-${dateStamp}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      })
+      .catch(() => setMembersError('Could not download backup.'));
   }
 
   const liveData = values[currentScenario];
@@ -858,7 +889,17 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
           <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg p-4">
             <div className="flex items-center justify-between mb-3">
               <div className="font-semibold text-sm">Workspace members</div>
-              <button onClick={() => setShowMembers(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted }}><X size={16} /></button>
+              <div className="flex items-center gap-2">
+                {canManageMembers && (
+                  <button
+                    onClick={downloadBackup}
+                    style={{ display: 'flex', alignItems: 'center', gap: 6, background: COLORS.surfaceAlt, color: COLORS.textDark, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '5px 10px', fontSize: 12, cursor: 'pointer' }}
+                  >
+                    <Download size={13} /> Download Backup
+                  </button>
+                )}
+                <button onClick={() => setShowMembers(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: COLORS.textMuted }}><X size={16} /></button>
+              </div>
             </div>
 
             {membersError && <div style={{ background: COLORS.brickSoft, color: COLORS.brick, borderRadius: 6, padding: '8px 10px', fontSize: 12.5, marginBottom: 12 }}>{membersError}</div>}
@@ -898,33 +939,36 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             )}
 
             <div className="flex flex-col gap-2">
-              {members.map((m) => (
-                <div key={m.userId} style={{ border: `1px solid ${COLORS.border}`, borderRadius: 8 }} className="flex items-center justify-between px-3 py-2">
-                  <div>
-                    <div className="text-sm font-medium">{m.email}</div>
-                    <div style={{ color: COLORS.textMuted }} className="text-xs">joined {new Date(m.joinedAt).toLocaleDateString()}</div>
-                  </div>
-                  {canManageMembers ? (
-                    <div className="flex items-center gap-2">
-                      <select
-                        value={m.role}
-                        onChange={(e) => changeMemberRole(m.userId, e.target.value)}
-                        style={{ border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '4px 6px', fontSize: 12 }}
-                      >
-                        <option value="viewer">Viewer</option>
-                        <option value="editor">Editor</option>
-                        <option value="power">Power user</option>
-                        <option value="admin">Admin</option>
-                      </select>
-                      <button onClick={() => removeMember(m.userId)} title="Remove from workspace" style={{ background: COLORS.brickSoft, color: COLORS.brick, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
-                        <Trash2 size={12} />
-                      </button>
+              {members.map((m) => {
+                const isSelf = m.userId === myUserId;
+                return (
+                  <div key={m.userId} style={{ border: `1px solid ${COLORS.border}`, borderRadius: 8 }} className="flex items-center justify-between px-3 py-2">
+                    <div>
+                      <div className="text-sm font-medium">{m.email}{isSelf && <span style={{ color: COLORS.textMuted, fontWeight: 400 }}> (you)</span>}</div>
+                      <div style={{ color: COLORS.textMuted }} className="text-xs">joined {new Date(m.joinedAt).toLocaleDateString()}</div>
                     </div>
-                  ) : (
-                    <span style={{ background: COLORS.surfaceAlt, borderRadius: 4, padding: '2px 8px', fontSize: 11.5, textTransform: 'capitalize', color: COLORS.textMuted }}>{m.role}</span>
-                  )}
-                </div>
-              ))}
+                    {canManageMembers && !isSelf ? (
+                      <div className="flex items-center gap-2">
+                        <select
+                          value={m.role}
+                          onChange={(e) => changeMemberRole(m.userId, e.target.value)}
+                          style={{ border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '4px 6px', fontSize: 12 }}
+                        >
+                          <option value="viewer">Viewer</option>
+                          <option value="editor">Editor</option>
+                          <option value="power">Power user</option>
+                          <option value="admin">Admin</option>
+                        </select>
+                        <button onClick={() => removeMember(m.userId)} title="Remove from workspace" style={{ background: COLORS.brickSoft, color: COLORS.brick, border: 'none', borderRadius: 6, padding: '5px 8px', cursor: 'pointer', display: 'flex', alignItems: 'center' }}>
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    ) : (
+                      <span style={{ background: COLORS.surfaceAlt, borderRadius: 4, padding: '2px 8px', fontSize: 11.5, textTransform: 'capitalize', color: COLORS.textMuted }}>{m.role}{isSelf && canManageMembers ? ' · ask another admin to change' : ''}</span>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
