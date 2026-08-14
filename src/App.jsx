@@ -96,6 +96,42 @@ const PIVOT_ACCOUNT_OPTIONS = ACCOUNTS.filter((a) => !a.isDriver);
 // every product row, which is confusing rather than wrong.
 const PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS = ACCOUNTS.filter((a) => a.id === 'product_revenue' || PRODUCT_DIMENSIONED_ACCOUNTS.includes(a.id));
 
+// Metadata for the 5 pivotable dimensions. Account and Scenario deliberately
+// have no "Total" member: summing the flat account list would double-count
+// rollups against their own children, and summing across scenarios has no
+// sensible meaning.
+const PIVOT_DIMENSIONS = {
+  account: { label: 'Account' },
+  entity: { label: 'Entity', hasTotal: true, totalId: 'company', totalName: 'Company (Total)' },
+  product: { label: 'Product', hasTotal: true, totalId: 'all', totalName: 'All Products (Total)' },
+  time: { label: 'Time', hasTotal: true, totalId: 'FY', totalName: 'FY (Total)' },
+  scenario: { label: 'Scenario' },
+};
+
+// The list of members for a dimension when it's placed on an axis. Pure and
+// reused for both rows and columns — whichever dimension lands where.
+function pivotMembers(dim, granularity) {
+  if (dim === 'account') return PIVOT_ACCOUNT_OPTIONS.map((a) => ({ id: a.id, name: a.name, unit: a.unit }));
+  if (dim === 'entity') return ENTITIES.map((e) => ({ id: e.id, name: e.name }));
+  if (dim === 'product') return PRODUCTS.map((p) => ({ id: p.id, name: p.name }));
+  if (dim === 'scenario') return SCENARIOS.map((s) => ({ id: s, name: s }));
+  if (dim === 'time') {
+    if (granularity === 'Annual') return []; // only the FY total exists — no sub-periods to list
+    if (granularity === 'Quarterly') return ['Q1', 'Q2', 'Q3', 'Q4'].map((q) => ({ id: q, name: q }));
+    return MONTHS.map((m) => ({ id: m, name: m }));
+  }
+  return [];
+}
+
+// Computes one cell's value for any assignment of the 5 dimensions to
+// {scenario, entity, account, period, product} — a thin wrapper around the
+// same getPeriodValue used by the default Account×Time grid, just with every
+// axis passed explicitly instead of some being fixed by closure.
+function getPivotCellValue(allScenarioValues, scenario, entityId, accountId, period, productId) {
+  const data = allScenarioValues[scenario] || {};
+  return getPeriodValue(data, entityId, accountId, period, productId);
+}
+
 /* ----------------------------------------------------------------------
    MODEL ENGINE  (pure functions — operate on a plain data object)
 ---------------------------------------------------------------------- */
@@ -247,8 +283,15 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const [currentScenario, setCurrentScenario] = useState('Budget');
   const [currentEntity, setCurrentEntity] = useState('company');
   const [currentProduct, setCurrentProduct] = useState('all');
-  const [rowDimension, setRowDimension] = useState('account'); // 'account' | 'entity' | 'product'
-  const [pivotAccount, setPivotAccount] = useState('revenue');
+  // Which of the 5 dimensions is on rows/columns/filter right now, plus the
+  // two genuinely new filter values (Entity and Product already have their
+  // own long-standing state above; Scenario's filter value is currentScenario
+  // itself, used elsewhere by Versions/Backups — none of those three are
+  // duplicated here).
+  const [axisAssignment, setAxisAssignment] = useState({ account: 'rows', entity: 'filter', product: 'filter', scenario: 'filter', time: 'cols' });
+  const [filterAccount, setFilterAccount] = useState('revenue');
+  const [filterTime, setFilterTime] = useState('FY');
+  const [dragChip, setDragChip] = useState(null);
   const [granularity, setGranularity] = useState('Monthly');
   const [expanded, setExpanded] = useState(() => new Set(['revenue', 'expenses']));
   const [compareMode, setCompareMode] = useState(false);
@@ -433,6 +476,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   }
 
   const liveData = values[currentScenario];
+  const isDefaultConfig = axisAssignment.account === 'rows' && axisAssignment.time === 'cols';
 
   const columns = useMemo(() => {
     if (granularity === 'Monthly') return [...MONTHS, 'FY'];
@@ -450,6 +494,77 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
     })(null, 0);
     return rows;
   }, [expanded]);
+
+  // Dragging a dimension chip into Rows or Columns (each holds exactly one)
+  // swaps it with whatever's currently there — the displaced dimension takes
+  // the dragged one's old zone. Filter (holds the remaining 3) never evicts.
+  function assignToZone(dim, targetZone) {
+    setAxisAssignment((prev) => {
+      if (prev[dim] === targetZone) return prev;
+      const next = { ...prev };
+      const sourceZone = prev[dim];
+      if (targetZone === 'rows' || targetZone === 'cols') {
+        const occupant = Object.keys(prev).find((k) => prev[k] === targetZone);
+        if (occupant) next[occupant] = sourceZone;
+      }
+      next[dim] = targetZone;
+      return next;
+    });
+    if (dim === 'product' && (targetZone === 'rows' || targetZone === 'cols') && !PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS.some((a) => a.id === filterAccount)) {
+      setFilterAccount('product_revenue');
+    }
+    if (targetZone === 'rows' || targetZone === 'cols') setCompareMode(false);
+  }
+
+  // The small value-picker embedded in a chip when that dimension is sitting
+  // in the Filter zone. stopPropagation on mousedown keeps clicking the
+  // select from being interpreted as the start of a drag.
+  function renderFilterValuePicker(dim) {
+    const stop = (e) => e.stopPropagation();
+    const style = { background: 'none', border: 'none', color: 'inherit', fontWeight: 700, fontSize: 12, cursor: 'pointer', outline: 'none' };
+    if (dim === 'entity') {
+      return (
+        <select value={currentEntity} onChange={(e) => setCurrentEntity(e.target.value)} onMouseDown={stop} className="lw-select" style={style}>
+          {ENTITY_OPTIONS.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
+        </select>
+      );
+    }
+    if (dim === 'product') {
+      return (
+        <select value={currentProduct} onChange={(e) => setCurrentProduct(e.target.value)} onMouseDown={stop} className="lw-select" style={style}>
+          <option value="all">All</option>
+          {PRODUCT_CATEGORIES.map((cat) => (
+            <optgroup key={cat.id} label={cat.name}>
+              {PRODUCTS.filter((p) => p.category === cat.id).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </optgroup>
+          ))}
+        </select>
+      );
+    }
+    if (dim === 'account') {
+      const options = axisAssignment.product !== 'filter' ? PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS : PIVOT_ACCOUNT_OPTIONS;
+      return (
+        <select value={filterAccount} onChange={(e) => setFilterAccount(e.target.value)} onMouseDown={stop} className="lw-select" style={style}>
+          {options.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+        </select>
+      );
+    }
+    if (dim === 'scenario') {
+      return (
+        <select value={currentScenario} onChange={(e) => setCurrentScenario(e.target.value)} onMouseDown={stop} className="lw-select" style={style}>
+          {SCENARIOS.map((s) => <option key={s} value={s}>{s}</option>)}
+        </select>
+      );
+    }
+    if (dim === 'time') {
+      return (
+        <select value={filterTime} onChange={(e) => setFilterTime(e.target.value)} onMouseDown={stop} className="lw-select" style={style}>
+          {[...MONTHS, 'Q1', 'Q2', 'Q3', 'Q4', 'FY'].map((p) => <option key={p} value={p}>{p}</option>)}
+        </select>
+      );
+    }
+    return null;
+  }
 
   function toggleExpand(id) {
     setExpanded((prev) => {
@@ -553,7 +668,10 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   // When Entity is the row axis, its filter chip is hidden — fall back to the
   // company-wide total for KPIs/chart rather than showing a stale, no-longer-
   // visible entity selection.
-  const kpiEntityContext = rowDimension === 'entity' ? 'company' : currentEntity;
+  // KPIs and the chart always show the company-wide total — a stable
+  // headline summary that doesn't change meaning depending on how the grid
+  // below happens to be pivoted at the moment.
+  const kpiEntityContext = 'company';
 
   const kpiRevenue = getPeriodValue(liveData, kpiEntityContext, 'revenue', 'FY');
   const kpiExpenses = getPeriodValue(liveData, kpiEntityContext, 'expenses', 'FY');
@@ -683,41 +801,6 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             >
               Log out
             </button>
-            {chipSelect('Rows', rowDimension, (e) => {
-              const next = e.target.value;
-              setRowDimension(next);
-              if (next !== 'account') setCompareMode(false);
-              if (next === 'product' && !PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS.some((a) => a.id === pivotAccount)) setPivotAccount('product_revenue');
-            }, (
-              <>
-                <option value="account">Account</option>
-                <option value="entity">Entity</option>
-                <option value="product">Product</option>
-              </>
-            ))}
-
-            {rowDimension !== 'entity' && chipSelect('Entity', currentEntity, (e) => setCurrentEntity(e.target.value), (
-              ENTITY_OPTIONS.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)
-            ))}
-
-            {rowDimension !== 'account' && chipSelect('Account', pivotAccount, (e) => setPivotAccount(e.target.value), (
-              (rowDimension === 'product' ? PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS : PIVOT_ACCOUNT_OPTIONS).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)
-            ))}
-
-            {rowDimension !== 'product' && chipSelect('Product', currentProduct, (e) => setCurrentProduct(e.target.value), (
-              <>
-                <option value="all">All Products</option>
-                {PRODUCT_CATEGORIES.map((cat) => (
-                  <optgroup key={cat.id} label={cat.name}>
-                    {PRODUCTS.filter((p) => p.category === cat.id).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-                  </optgroup>
-                ))}
-              </>
-            ), { title: 'Filters Product Revenue, Units Sold, and Unit Price only — every other line always shows the full total.' })}
-
-            {chipSelect('Scenario', currentScenario, (e) => setCurrentScenario(e.target.value), (
-              SCENARIOS.map((s) => <option key={s} value={s}>{s}</option>)
-            ))}
 
             <div style={{ background: COLORS.bgChrome2, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 6, padding: 2 }} className="flex">
               {['Monthly', 'Quarterly', 'Annual'].map((g) => (
@@ -736,7 +819,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
               ))}
             </div>
 
-            {rowDimension === 'account' && (
+            {isDefaultConfig && (
               <button
                 onClick={() => setCompareMode((c) => !c)}
                 style={{
@@ -789,6 +872,48 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
 
       {location.pathname === '/' && (
       <>
+      {/* ---------------- Pivot configuration ---------------- */}
+      <div className="px-6 pt-4">
+        <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 10, padding: 12 }} className="flex items-stretch gap-3 flex-wrap">
+          {['rows', 'cols', 'filter'].map((zone) => (
+            <div
+              key={zone}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={() => { if (dragChip) assignToZone(dragChip, zone); setDragChip(null); }}
+              style={{
+                flex: zone === 'filter' ? 2 : 1, minWidth: zone === 'filter' ? 230 : 110,
+                border: `1.5px dashed ${COLORS.border}`, borderRadius: 8, padding: '8px 10px',
+                display: 'flex', flexDirection: 'column', gap: 6,
+              }}
+            >
+              <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: '.06em', color: COLORS.textMuted, textTransform: 'uppercase' }}>
+                {zone === 'rows' ? 'Rows' : zone === 'cols' ? 'Columns' : 'Filters'}
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                {Object.keys(axisAssignment).filter((d) => axisAssignment[d] === zone).map((dim) => (
+                  <div
+                    key={dim}
+                    draggable
+                    onDragStart={() => setDragChip(dim)}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 5, background: COLORS.jadeSoft, color: COLORS.jade,
+                      borderRadius: 999, padding: '5px 10px', fontSize: 12.5, fontWeight: 600, cursor: 'grab', userSelect: 'none',
+                    }}
+                  >
+                    <GripVertical size={11} />
+                    {PIVOT_DIMENSIONS[dim].label}
+                    {zone === 'filter' && renderFilterValuePicker(dim)}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{ color: COLORS.textMuted }} className="text-xs mt-1.5">
+          Drag a dimension between Rows, Columns, and Filters to reshape the grid below. Only the default Account × Time arrangement supports full editing and hierarchy drill-down — other arrangements are read-only.
+        </div>
+      </div>
+
       {/* ---------------- KPI strip ---------------- */}
       <div className="px-6 pt-5 grid grid-cols-3 gap-4">
         {[
@@ -806,7 +931,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       {/* ---------------- Trend chart ---------------- */}
       <div className="px-6 pt-4">
         <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg px-4 py-3">
-          <div style={{ color: COLORS.textMuted }} className="text-xs mb-2">Monthly trend — {ENTITY_OPTIONS.find((e) => e.id === currentEntity)?.name}, {currentScenario}</div>
+          <div style={{ color: COLORS.textMuted }} className="text-xs mb-2">Monthly trend — Company (Consolidated), {currentScenario}</div>
           <div style={{ height: 200 }}>
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={chartData} margin={{ top: 5, right: 12, left: -12, bottom: 0 }}>
@@ -826,14 +951,14 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
 
       {/* ---------------- Grid ---------------- */}
       <div className="px-6 pt-4 pb-2">
-        {rowDimension === 'account' && !compareMode && (!canEdit || currentProduct === 'all') && (
+        {isDefaultConfig && !compareMode && (!canEdit || currentProduct === 'all') && (
           <div style={{ color: COLORS.textMuted }} className="text-xs mb-2">
             {currentEntity === 'company' && 'Select a specific entity to edit inputs. '}
             {granularity !== 'Monthly' && 'Switch to Monthly view to edit inputs. '}
             {currentProduct === 'all' && 'Select a specific product to edit Units Sold or Unit Price.'}
           </div>
         )}
-        {rowDimension === 'account' && (
+        {isDefaultConfig && (
         <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
           <div className="overflow-x-auto">
             <table style={{ minWidth: compareMode ? 640 : columns.length * 92 + 220, borderCollapse: 'collapse' }} className="w-full text-sm">
@@ -986,126 +1111,104 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
           </div>
         </div>
         )}
-        {rowDimension === 'account' && (
+        {isDefaultConfig && (
         <div style={{ color: COLORS.textMuted }} className="text-xs mt-2">
           Rail colors: <span style={{ color: COLORS.jade }}>■</span> rollup &nbsp; <span style={{ color: COLORS.violet }}>■</span> formula &nbsp; <span style={{ color: COLORS.amber }}>■</span> driver input &nbsp; <span style={{ color: COLORS.border }}>■</span> input. Edits save to the shared workspace on the budget server as you type.
         </div>
         )}
 
-        {rowDimension === 'entity' && (() => {
-          const isProductAcct = PRODUCT_DIMENSIONED_ACCOUNTS.includes(pivotAccount);
-          const isLeafInput = ACCOUNTS_BY_ID[pivotAccount]?.type === 'input';
-          const productKey = isProductAcct ? currentProduct : 'none';
-          return (
-            <>
-              {!canEditData || granularity !== 'Monthly' || !isLeafInput || (isProductAcct && currentProduct === 'all') ? (
-                <div style={{ color: COLORS.textMuted }} className="text-xs mb-2">
-                  {!isLeafInput && `"${ACCOUNTS_BY_ID[pivotAccount]?.name}" is a rollup or formula — pick a directly-entered line item to edit values. `}
-                  {isLeafInput && granularity !== 'Monthly' && 'Switch to Monthly view to edit inputs. '}
-                  {isLeafInput && isProductAcct && currentProduct === 'all' && 'Select a specific product to edit this line.'}
-                </div>
-              ) : null}
-              <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
-                <div className="overflow-x-auto">
-                  <table style={{ minWidth: columns.length * 92 + 220, borderCollapse: 'collapse' }} className="w-full text-sm">
-                    <thead>
-                      <tr style={{ background: COLORS.bgChrome }}>
-                        <th style={{ position: 'sticky', left: 0, background: COLORS.bgChrome, color: COLORS.textOnDark, zIndex: 2 }} className="text-left px-3 py-2 text-xs font-medium whitespace-nowrap">Entity</th>
-                        {columns.map((c) => (
-                          <th key={c} style={{ color: c === 'FY' ? '#fff' : COLORS.textOnDarkMuted, background: c === 'FY' ? '#232B3D' : 'transparent' }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">{c}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {ENTITIES.map((ent) => (
-                        <tr key={ent.id} className="lw-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
-                          <td style={{ position: 'sticky', left: 0, background: COLORS.surface, zIndex: 1 }} className="px-3 py-1.5 whitespace-nowrap text-sm">{ent.name}</td>
-                          {columns.map((col) => {
-                            const val = getPeriodValue(liveData, ent.id, pivotAccount, col, currentProduct);
-                            const editableHere = canEditData && isLeafInput && MONTHS.includes(col) && granularity === 'Monthly' && (!isProductAcct || currentProduct !== 'all') && !compareMode;
-                            return (
-                              <td key={col} style={{ background: col === 'FY' ? COLORS.surfaceAlt : COLORS.surface }} className="px-3 py-1.5 text-right">
-                                {editableHere ? (
-                                  <input type="number" className="lw-num lw-cell-input" value={liveData[ent.id]?.[pivotAccount]?.[productKey]?.[col] ?? 0} onChange={(e) => updateValue(ent.id, pivotAccount, col, e.target.value)} />
-                                ) : (
-                                  <span className="lw-num" style={{ fontSize: 12.5, fontWeight: col === 'FY' ? 600 : 400 }}>{fmtCell(ACCOUNTS_BY_ID[pivotAccount]?.unit || '$', val)}</span>
-                                )}
-                              </td>
-                            );
-                          })}
-                        </tr>
-                      ))}
-                      <tr style={{ borderTop: `2px solid ${COLORS.textDark}` }}>
-                        <td style={{ position: 'sticky', left: 0, background: '#1C2333', color: '#fff', zIndex: 1 }} className="px-3 py-2 font-bold whitespace-nowrap text-sm">Company (Total)</td>
-                        {columns.map((col) => (
-                          <td key={col} className="px-3 py-2 text-right lw-num font-semibold" style={{ fontSize: 12.5, background: COLORS.violet, color: '#fff' }}>
-                            {fmtCell(ACCOUNTS_BY_ID[pivotAccount]?.unit || '$', getPeriodValue(liveData, 'company', pivotAccount, col, currentProduct))}
-                          </td>
-                        ))}
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </>
-          );
-        })()}
+        {!isDefaultConfig && (() => {
+          const rowsDim = Object.keys(axisAssignment).find((d) => axisAssignment[d] === 'rows');
+          const colsDim = Object.keys(axisAssignment).find((d) => axisAssignment[d] === 'cols');
+          const rowMembers = pivotMembers(rowsDim, granularity);
+          const colMembers = pivotMembers(colsDim, granularity);
+          const rowsHasTotal = PIVOT_DIMENSIONS[rowsDim]?.hasTotal;
+          const colsHasTotal = PIVOT_DIMENSIONS[colsDim]?.hasTotal;
+          const DIM_KEY = { entity: 'entity', account: 'account', time: 'period', product: 'product', scenario: 'scenario' };
 
-        {rowDimension === 'product' && (() => {
-          const isProductAcct = PRODUCT_DIMENSIONED_ACCOUNTS.includes(pivotAccount);
-          const isLeafInput = ACCOUNTS_BY_ID[pivotAccount]?.type === 'input';
+          function filterValueFor(dim) {
+            if (dim === 'entity') return currentEntity;
+            if (dim === 'product') return currentProduct;
+            if (dim === 'account') return filterAccount;
+            if (dim === 'scenario') return currentScenario;
+            if (dim === 'time') return filterTime;
+            return null;
+          }
+          function cellArgs(rowId, colId) {
+            const args = {};
+            Object.keys(DIM_KEY).forEach((dim) => {
+              const key = DIM_KEY[dim];
+              if (dim === rowsDim) args[key] = rowId;
+              else if (dim === colsDim) args[key] = colId;
+              else args[key] = filterValueFor(dim);
+            });
+            return args;
+          }
+          function valueAt(rowId, colId) {
+            const a = cellArgs(rowId, colId);
+            return getPivotCellValue(values, a.scenario, a.entity, a.account, a.period, a.product);
+          }
+          function unitFor(rowId, colId) {
+            if (rowsDim === 'account') return ACCOUNTS_BY_ID[rowId]?.unit || '$';
+            if (colsDim === 'account') return ACCOUNTS_BY_ID[colId]?.unit || '$';
+            return ACCOUNTS_BY_ID[filterAccount]?.unit || '$';
+          }
+
           return (
-            <>
-              {!canEditData || granularity !== 'Monthly' || !isLeafInput || !isProductAcct || currentEntity === 'company' ? (
-                <div style={{ color: COLORS.textMuted }} className="text-xs mb-2">
-                  {!isProductAcct && `"${ACCOUNTS_BY_ID[pivotAccount]?.name}" doesn't vary by product, so these rows show the same value for reference — pick Units Sold or Unit Price to edit. `}
-                  {isProductAcct && granularity !== 'Monthly' && 'Switch to Monthly view to edit inputs. '}
-                  {isProductAcct && currentEntity === 'company' && 'Select a specific entity to edit inputs.'}
-                </div>
-              ) : null}
-              <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
-                <div className="overflow-x-auto">
-                  <table style={{ minWidth: columns.length * 92 + 220, borderCollapse: 'collapse' }} className="w-full text-sm">
-                    <thead>
-                      <tr style={{ background: COLORS.bgChrome }}>
-                        <th style={{ position: 'sticky', left: 0, background: COLORS.bgChrome, color: COLORS.textOnDark, zIndex: 2 }} className="text-left px-3 py-2 text-xs font-medium whitespace-nowrap">Product</th>
-                        {columns.map((c) => (
-                          <th key={c} style={{ color: c === 'FY' ? '#fff' : COLORS.textOnDarkMuted, background: c === 'FY' ? '#232B3D' : 'transparent' }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">{c}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {PRODUCTS.map((prod) => (
-                        <tr key={prod.id} className="lw-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
-                          <td style={{ position: 'sticky', left: 0, background: COLORS.surface, zIndex: 1 }} className="px-3 py-1.5 whitespace-nowrap text-sm">{prod.name}</td>
-                          {columns.map((col) => {
-                            const val = getPeriodValue(liveData, currentEntity, pivotAccount, col, prod.id);
-                            const editableHere = canEditData && isLeafInput && isProductAcct && MONTHS.includes(col) && granularity === 'Monthly' && currentEntity !== 'company' && !compareMode;
-                            return (
-                              <td key={col} style={{ background: col === 'FY' ? COLORS.surfaceAlt : COLORS.surface }} className="px-3 py-1.5 text-right">
-                                {editableHere ? (
-                                  <input type="number" className="lw-num lw-cell-input" value={liveData[currentEntity]?.[pivotAccount]?.[prod.id]?.[col] ?? 0} onChange={(e) => updateValue(currentEntity, pivotAccount, col, e.target.value, prod.id)} />
-                                ) : (
-                                  <span className="lw-num" style={{ fontSize: 12.5, fontWeight: col === 'FY' ? 600 : 400 }}>{fmtCell(ACCOUNTS_BY_ID[pivotAccount]?.unit || '$', val)}</span>
-                                )}
-                              </td>
-                            );
-                          })}
-                        </tr>
+            <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
+              <div className="overflow-x-auto">
+                <table style={{ minWidth: (colMembers.length + (colsHasTotal ? 1 : 0)) * 110 + 200, borderCollapse: 'collapse' }} className="w-full text-sm">
+                  <thead>
+                    <tr style={{ background: COLORS.bgChrome }}>
+                      <th style={{ position: 'sticky', left: 0, background: COLORS.bgChrome, color: COLORS.textOnDark, zIndex: 2 }} className="text-left px-3 py-2 text-xs font-medium whitespace-nowrap">
+                        {PIVOT_DIMENSIONS[rowsDim]?.label}
+                      </th>
+                      {colMembers.map((c) => (
+                        <th key={c.id} style={{ color: COLORS.textOnDarkMuted }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">{c.name}</th>
                       ))}
-                      <tr style={{ borderTop: `2px solid ${COLORS.textDark}` }}>
-                        <td style={{ position: 'sticky', left: 0, background: '#1C2333', color: '#fff', zIndex: 1 }} className="px-3 py-2 font-bold whitespace-nowrap text-sm">All Products (Total)</td>
-                        {columns.map((col) => (
-                          <td key={col} className="px-3 py-2 text-right lw-num font-semibold" style={{ fontSize: 12.5, background: COLORS.violet, color: '#fff' }}>
-                            {fmtCell(ACCOUNTS_BY_ID[pivotAccount]?.unit || '$', getPeriodValue(liveData, currentEntity, pivotAccount, col, 'all'))}
+                      {colsHasTotal && (
+                        <th style={{ color: '#fff', background: '#232B3D' }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">{PIVOT_DIMENSIONS[colsDim].totalName}</th>
+                      )}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rowMembers.map((r) => (
+                      <tr key={r.id} className="lw-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
+                        <td style={{ position: 'sticky', left: 0, background: COLORS.surface, zIndex: 1 }} className="px-3 py-1.5 whitespace-nowrap text-sm">{r.name}</td>
+                        {colMembers.map((c) => (
+                          <td key={c.id} className="px-3 py-1.5 text-right">
+                            <span className="lw-num" style={{ fontSize: 12.5 }}>{fmtCell(unitFor(r.id, c.id), valueAt(r.id, c.id))}</span>
                           </td>
                         ))}
+                        {colsHasTotal && (
+                          <td className="px-3 py-1.5 text-right font-semibold" style={{ background: COLORS.surfaceAlt }}>
+                            <span className="lw-num" style={{ fontSize: 12.5 }}>{fmtCell(unitFor(r.id, PIVOT_DIMENSIONS[colsDim].totalId), valueAt(r.id, PIVOT_DIMENSIONS[colsDim].totalId))}</span>
+                          </td>
+                        )}
                       </tr>
-                    </tbody>
-                  </table>
-                </div>
+                    ))}
+                    {rowsHasTotal && (
+                      <tr style={{ borderTop: `2px solid ${COLORS.textDark}` }}>
+                        <td style={{ position: 'sticky', left: 0, background: '#1C2333', color: '#fff', zIndex: 1 }} className="px-3 py-2 font-bold whitespace-nowrap text-sm">{PIVOT_DIMENSIONS[rowsDim].totalName}</td>
+                        {colMembers.map((c) => (
+                          <td key={c.id} className="px-3 py-2 text-right font-semibold" style={{ background: COLORS.violet, color: '#fff' }}>
+                            <span className="lw-num" style={{ fontSize: 12.5 }}>{fmtCell(unitFor(PIVOT_DIMENSIONS[rowsDim].totalId, c.id), valueAt(PIVOT_DIMENSIONS[rowsDim].totalId, c.id))}</span>
+                          </td>
+                        ))}
+                        {colsHasTotal && (
+                          <td className="px-3 py-2 text-right font-semibold" style={{ background: COLORS.violet, color: '#fff' }}>
+                            <span className="lw-num" style={{ fontSize: 12.5 }}>{fmtCell(unitFor(PIVOT_DIMENSIONS[rowsDim].totalId, PIVOT_DIMENSIONS[colsDim].totalId), valueAt(PIVOT_DIMENSIONS[rowsDim].totalId, PIVOT_DIMENSIONS[colsDim].totalId))}</span>
+                          </td>
+                        )}
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
               </div>
-            </>
+              <div style={{ color: COLORS.textMuted, borderColor: COLORS.border }} className="text-xs px-3 py-2 border-t">
+                Read-only in this arrangement. Switch Rows to Account and Columns to Time to edit values.
+              </div>
+            </div>
           );
         })()}
       </div>
