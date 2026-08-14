@@ -1,7 +1,9 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
+import * as XLSX from 'xlsx';
 import {
   ChevronRight, ChevronDown, Save, RotateCcw, Trash2, X, ArrowLeftRight, History, Eye, EyeOff, Download, Archive,
+  Plus, Edit3, GripVertical, Search, Network,
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
@@ -205,6 +207,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const showVersions = location.pathname === '/versions';
   const showMembers = location.pathname === '/members';
   const showBackups = location.pathname === '/backups';
+  const showHierarchy = location.pathname === '/hierarchy';
 
   const [values, setValues] = useState({});
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
@@ -256,6 +259,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const canManageMembers = role === 'admin';
   const canEditData = role === 'editor' || role === 'power' || role === 'admin';
   const canManageBackups = role === 'power' || role === 'admin';
+  const canManageHierarchy = role === 'power' || role === 'admin';
   const myUserId = useMemo(() => decodeToken(token)?.userId, [token]);
 
   function loadMembers() {
@@ -539,6 +543,13 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
         .lw-cell-input { -moz-appearance: textfield; }
         .lw-row:hover td { filter: brightness(0.98); }
         select.lw-select { font-family: 'IBM Plex Sans', sans-serif; }
+        .hier-row:hover { background: ${COLORS.surfaceAlt}; }
+        .hier-row.selected { background: ${COLORS.jadeSoft}; }
+        .hier-actions { opacity: 0; }
+        .hier-row:hover .hier-actions { opacity: 1; }
+        .hier-drag-handle { opacity: 0; }
+        .hier-row:hover .hier-drag-handle { opacity: 0.5; }
+        .hier-row.drag-over { outline: 2px dashed ${COLORS.jade}; outline-offset: -2px; }
       `}</style>
 
       {/* ---------------- Top chrome ---------------- */}
@@ -589,6 +600,18 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                 }}
               >
                 <Archive size={13} /> Backups {backups.length > 0 ? `(${backups.length})` : ''}
+              </button>
+            )}
+            {canManageHierarchy && (
+              <button
+                onClick={() => navigate(showHierarchy ? '/' : '/hierarchy')}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, padding: '5px 10px', borderRadius: 6, fontSize: 12.5,
+                  background: showHierarchy ? COLORS.violet : 'none', color: showHierarchy ? '#fff' : COLORS.textOnDarkMuted,
+                  border: `1px solid ${showHierarchy ? COLORS.violet : COLORS.chromeBorder}`, cursor: 'pointer',
+                }}
+              >
+                <Network size={13} /> Hierarchy
               </button>
             )}
             <div className="flex items-center gap-1.5 text-xs" style={{ color: saveStatus === 'error' ? COLORS.brick : COLORS.textOnDarkMuted }}>
@@ -907,6 +930,19 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       </>
       )}
 
+      {/* ---------------- Hierarchy editor page ---------------- */}
+      {showHierarchy && (
+        canManageHierarchy ? (
+          <HierarchyEditor token={token} />
+        ) : (
+          <div className="px-6 pb-6">
+            <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg p-4 text-sm" >
+              You need Power or Admin access to open the hierarchy editor.
+            </div>
+          </div>
+        )
+      )}
+
       {/* ---------------- Versions drawer ---------------- */}
       {showVersions && (
         <div className="px-6 pb-6">
@@ -1132,6 +1168,393 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------------------
+   HIERARCHY EDITOR — Power/Admin only. Wired to the real backend: the tree
+   below reflects your actual Accounts/Entities/Products structure and
+   every edit (rename, add, delete, move, attributes) is saved for real.
+   Renaming/deleting here does NOT yet change how the P&L grid itself
+   calculates — see the in-page note for what that next step would mean.
+---------------------------------------------------------------------- */
+function hierFindNode(node, id) {
+  if (!node) return null;
+  if (node.id === id) return node;
+  if (node.children) for (const c of node.children) { const f = hierFindNode(c, id); if (f) return f; }
+  return null;
+}
+function hierFindParent(node, targetId, parent) {
+  if (!node) return null;
+  if (node.id === targetId) return parent;
+  if (node.children) for (const c of node.children) { const f = hierFindParent(c, targetId, node); if (f) return f; }
+  return null;
+}
+function hierCountLeaves(node) {
+  if (node.type === 'leaf') return 1;
+  return (node.children || []).reduce((s, c) => s + hierCountLeaves(c), 0);
+}
+function hierMatchesFilter(node, term) {
+  if (!term) return true;
+  if (node.name.toLowerCase().includes(term)) return true;
+  return (node.children || []).some((c) => hierMatchesFilter(c, term));
+}
+function hierCloneAndUpdate(node, targetId, updater) {
+  if (node.id === targetId) return { ...node, ...updater(node) };
+  if (node.children) return { ...node, children: node.children.map((c) => hierCloneAndUpdate(c, targetId, updater)) };
+  return node;
+}
+
+function HierarchyEditor({ token }) {
+  const [currentDim, setCurrentDim] = useState('Products');
+  const [tree, setTree] = useState(null);
+  const [attributeDefs, setAttributeDefs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [selectedId, setSelectedId] = useState(null);
+  const [expandedIds, setExpandedIds] = useState(() => new Set());
+  const [searchTerm, setSearchTerm] = useState('');
+  const [dragId, setDragId] = useState(null);
+  const [dragOverId, setDragOverId] = useState(null);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [newAttrName, setNewAttrName] = useState('');
+  const [usageCount, setUsageCount] = useState(null);
+  const [saveError, setSaveError] = useState('');
+
+  function fetchHierarchy(dimension) {
+    setLoading(true);
+    setLoadError('');
+    fetch(`${API_BASE}/workspace/hierarchy/${dimension}`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) { setLoadError(data.error || 'Could not load this dimension.'); setLoading(false); return; }
+        setTree(data.tree);
+        setAttributeDefs(data.attributeDefs);
+        setExpandedIds(new Set([data.tree.id, ...(data.tree.children || []).map((c) => c.id)]));
+        setLoading(false);
+      })
+      .catch(() => { setLoadError('Could not load this dimension.'); setLoading(false); });
+  }
+
+  useEffect(() => {
+    setSelectedId(null);
+    setSearchTerm('');
+    setConfirmingDelete(false);
+    fetchHierarchy(currentDim);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentDim]);
+
+  const selectedNode = tree && selectedId ? hierFindNode(tree, selectedId) : null;
+
+  useEffect(() => {
+    if (!selectedNode) { setUsageCount(null); return; }
+    fetch(`${API_BASE}/workspace/hierarchy/${currentDim}/usage/${selectedNode.id}`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json())
+      .then((data) => setUsageCount(typeof data.count === 'number' ? data.count : null))
+      .catch(() => setUsageCount(null));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, currentDim]);
+
+  function toggleExpand(id) {
+    setExpandedIds((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  }
+  function selectNode(id) { setSelectedId(id); setConfirmingDelete(false); }
+  function switchDim(name) { setCurrentDim(name); }
+
+  function renameNode(node, name) {
+    setTree((prev) => hierCloneAndUpdate(prev, node.id, () => ({ name })));
+    setSaveError('');
+    fetch(`${API_BASE}/workspace/hierarchy/${currentDim}/nodes/${node.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name }),
+    }).catch(() => setSaveError('Could not save the rename.'));
+  }
+  function setAttrValue(node, key, value) {
+    const nextAttrs = { ...(node.attrs || {}), [key]: value };
+    setTree((prev) => hierCloneAndUpdate(prev, node.id, () => ({ attrs: nextAttrs })));
+    setSaveError('');
+    fetch(`${API_BASE}/workspace/hierarchy/${currentDim}/nodes/${node.id}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ attrs: nextAttrs }),
+    }).catch(() => setSaveError('Could not save the attribute.'));
+  }
+  function addCategoryToRoot() {
+    setSaveError('');
+    fetch(`${API_BASE}/workspace/hierarchy/${currentDim}/nodes`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ parentId: tree.id, name: 'New category', type: 'cat' }),
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) { setSaveError(data.error || 'Could not add category.'); return; }
+        setExpandedIds((prev) => new Set(prev).add(tree.id));
+        setSelectedId(data.id);
+        fetchHierarchy(currentDim);
+      })
+      .catch(() => setSaveError('Could not add category.'));
+  }
+  function addLeafTo(catNode) {
+    setSaveError('');
+    fetch(`${API_BASE}/workspace/hierarchy/${currentDim}/nodes`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ parentId: catNode.id, name: 'New item', type: 'leaf' }),
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) { setSaveError(data.error || 'Could not add item.'); return; }
+        setExpandedIds((prev) => new Set(prev).add(catNode.id));
+        setSelectedId(data.id);
+        fetchHierarchy(currentDim);
+      })
+      .catch(() => setSaveError('Could not add item.'));
+  }
+  function deleteSelected() {
+    if (!selectedNode || selectedNode.id === tree.id) return;
+    setSaveError('');
+    fetch(`${API_BASE}/workspace/hierarchy/${currentDim}/nodes/${selectedNode.id}`, {
+      method: 'DELETE', headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) { setSaveError(data.error || 'Could not delete.'); return; }
+        setSelectedId(null);
+        setConfirmingDelete(false);
+        fetchHierarchy(currentDim);
+      })
+      .catch(() => setSaveError('Could not delete.'));
+  }
+  function handleDrop(targetCat) {
+    if (targetCat.type !== 'cat' || !dragId || dragId === targetCat.id) { setDragId(null); setDragOverId(null); return; }
+    setSaveError('');
+    fetch(`${API_BASE}/workspace/hierarchy/${currentDim}/nodes/${dragId}/move`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ newParentId: targetCat.id }),
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) { setSaveError(data.error || 'Could not move item.'); setDragId(null); setDragOverId(null); return; }
+        setExpandedIds((prev) => new Set(prev).add(targetCat.id));
+        setSelectedId(dragId);
+        setDragId(null);
+        setDragOverId(null);
+        fetchHierarchy(currentDim);
+      })
+      .catch(() => { setSaveError('Could not move item.'); setDragId(null); setDragOverId(null); });
+  }
+  function addAttributeDef() {
+    const name = newAttrName.trim();
+    if (!name || attributeDefs.includes(name)) return;
+    setSaveError('');
+    fetch(`${API_BASE}/workspace/hierarchy/${currentDim}/attributes`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ action: 'add', name }),
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => {
+        if (!ok) { setSaveError(data.error || 'Could not add attribute.'); return; }
+        setNewAttrName('');
+        fetchHierarchy(currentDim);
+      })
+      .catch(() => setSaveError('Could not add attribute.'));
+  }
+  function removeAttributeDef(name) {
+    setSaveError('');
+    fetch(`${API_BASE}/workspace/hierarchy/${currentDim}/attributes`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ action: 'remove', name }),
+    })
+      .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+      .then(({ ok, data }) => { if (!ok) setSaveError(data.error || 'Could not remove attribute.'); else fetchHierarchy(currentDim); })
+      .catch(() => setSaveError('Could not remove attribute.'));
+  }
+
+  function flattenForExport() {
+    const rows = [];
+    (function walk(node, path) {
+      if (node.children && node.children.length) {
+        node.children.forEach((c) => walk(c, node === tree ? path : [...path, node.name]));
+      } else {
+        rows.push({ path, name: node.name, attrs: node.attrs || {} });
+      }
+    })(tree, []);
+    const maxDepth = rows.reduce((m, r) => Math.max(m, r.path.length), 0);
+    const levelHeaders = maxDepth === 0 ? [] : maxDepth === 1 ? ['Category'] : Array.from({ length: maxDepth }, (_, i) => `Level ${i + 1}`);
+    const headers = [...levelHeaders, 'Name', ...attributeDefs];
+    const body = rows.map((r) => {
+      const levelCols = Array.from({ length: maxDepth }, (_, i) => r.path[i] || '');
+      return [...levelCols, r.name, ...attributeDefs.map((d) => r.attrs[d] || '')];
+    });
+    return [headers, ...body];
+  }
+  function exportToExcel() {
+    const aoa = flattenForExport();
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = aoa[0].map((_, i) => ({ wch: Math.max(12, ...aoa.map((r) => String(r[i] ?? '').length)) }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, currentDim.slice(0, 31));
+    XLSX.writeFile(wb, `rosebud-${currentDim.toLowerCase()}-export.xlsx`);
+  }
+
+  function renderRow(node, depth) {
+    const term = searchTerm.trim().toLowerCase();
+    if (!hierMatchesFilter(node, term)) return null;
+    const isCat = node.type === 'cat';
+    const isOpen = expandedIds.has(node.id);
+    const isSelected = node.id === selectedId;
+    return (
+      <div key={node.id}>
+        <div
+          className={`hier-row${isSelected ? ' selected' : ''}${dragOverId === node.id ? ' drag-over' : ''}`}
+          draggable={!isCat}
+          onDragStart={() => setDragId(node.id)}
+          onDragOver={(e) => { if (isCat && dragId && dragId !== node.id) { e.preventDefault(); setDragOverId(node.id); } }}
+          onDragLeave={() => setDragOverId((cur) => (cur === node.id ? null : cur))}
+          onDrop={(e) => { e.preventDefault(); handleDrop(node); }}
+          onClick={() => selectNode(node.id)}
+          style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px', borderRadius: 6, cursor: 'pointer', marginLeft: depth * 22 }}
+        >
+          {node.children ? (
+            <span onClick={(e) => { e.stopPropagation(); toggleExpand(node.id); }} style={{ display: 'flex', color: COLORS.textMuted, cursor: 'pointer' }}>
+              {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            </span>
+          ) : <span style={{ width: 14, flexShrink: 0 }} />}
+          <span style={{ width: 3, alignSelf: 'stretch', borderRadius: 2, flexShrink: 0, background: isCat ? COLORS.jade : COLORS.border }} />
+          {!isCat && <GripVertical size={12} className="hier-drag-handle" style={{ color: COLORS.textMuted, flexShrink: 0 }} />}
+          <span style={{ fontSize: 13, fontWeight: isCat ? 700 : 400, letterSpacing: isCat ? '.01em' : 0 }}>{node.name}</span>
+          <span className="hier-actions" style={{ display: 'flex', gap: 2, marginLeft: 2 }}>
+            {isCat && (
+              <button onClick={(e) => { e.stopPropagation(); addLeafTo(node); }} title="Add item" style={{ background: 'none', border: 'none', color: COLORS.textMuted, cursor: 'pointer', display: 'flex', padding: 3, borderRadius: 4 }}>
+                <Plus size={13} />
+              </button>
+            )}
+            <button onClick={(e) => { e.stopPropagation(); selectNode(node.id); }} title="Edit" style={{ background: 'none', border: 'none', color: COLORS.textMuted, cursor: 'pointer', display: 'flex', padding: 3, borderRadius: 4 }}>
+              <Edit3 size={13} />
+            </button>
+          </span>
+        </div>
+        {node.children && isOpen && node.children.map((c) => renderRow(c, depth + 1))}
+      </div>
+    );
+  }
+
+  if (loading) {
+    return <div className="px-6 pt-4 pb-6"><div style={{ color: COLORS.textMuted, fontSize: 13 }}>Loading hierarchy…</div></div>;
+  }
+  if (loadError || !tree) {
+    return <div className="px-6 pt-4 pb-6"><div style={{ color: COLORS.brick, fontSize: 13 }}>{loadError || 'Could not load this dimension.'}</div></div>;
+  }
+
+  const parentOfSelected = selectedNode && selectedNode.id !== tree.id ? hierFindParent(tree, selectedNode.id, null) : null;
+  const breadcrumb = selectedNode
+    ? (selectedNode.type === 'leaf' && parentOfSelected ? `${currentDim} / ${parentOfSelected.name} / ${selectedNode.name}` : `${currentDim} / ${selectedNode.name}`)
+    : '';
+
+  return (
+    <div className="px-6 pt-4 pb-6">
+      <div style={{ background: COLORS.violetSoft, color: COLORS.violet, borderRadius: 8, padding: '8px 12px', fontSize: 12.5, marginBottom: 12 }}>
+        Wired to your real {currentDim.toLowerCase()} structure — edits here save for real. Renaming or restructuring doesn't yet change how the P&L grid itself calculates.
+      </div>
+      {saveError && <div style={{ background: COLORS.brickSoft, color: COLORS.brick, borderRadius: 8, padding: '8px 12px', fontSize: 12.5, marginBottom: 12 }}>{saveError}</div>}
+      <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 10, overflow: 'hidden', display: 'flex', minHeight: 460 }}>
+        <div style={{ flex: 1, padding: '16px 20px', borderRight: `1px solid ${COLORS.border}` }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+            <select value={currentDim} onChange={(e) => switchDim(e.target.value)} className="lw-select" style={{ border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '6px 10px', fontSize: 13 }}>
+              <option>Products</option>
+              <option>Accounts</option>
+              <option>Entities</option>
+            </select>
+            <div style={{ position: 'relative', flex: 1 }}>
+              <Search size={14} style={{ position: 'absolute', left: 10, top: 9, color: COLORS.textMuted }} />
+              <input value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} placeholder="Filter..." style={{ width: '100%', border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: '8px 12px 8px 32px', fontSize: 13 }} />
+            </div>
+            <button onClick={addCategoryToRoot} style={{ display: 'flex', alignItems: 'center', gap: 5, color: COLORS.jade, fontSize: 12.5, fontWeight: 600, background: COLORS.jadeSoft, border: 'none', borderRadius: 6, padding: '8px 12px', cursor: 'pointer', whiteSpace: 'nowrap' }}>
+              <Plus size={13} /> Add category
+            </button>
+            <button onClick={exportToExcel} style={{ display: 'flex', alignItems: 'center', gap: 5, color: COLORS.violet, fontSize: 12.5, fontWeight: 600, background: COLORS.violetSoft, border: 'none', borderRadius: 6, padding: '8px 12px', cursor: 'pointer', whiteSpace: 'nowrap' }}>
+              <Download size={13} /> Export to Excel
+            </button>
+          </div>
+          {renderRow(tree, 0)}
+        </div>
+
+        <div style={{ width: 300, padding: '16px 20px', background: COLORS.surfaceAlt }}>
+          {!selectedNode ? (
+            <div style={{ color: COLORS.textMuted, fontSize: 12.5, lineHeight: 1.6 }}>
+              Select a category or item on the left to rename, move, or delete it. Drag any item onto a category to move it there.
+            </div>
+          ) : (
+            <>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 2 }}>
+                <button onClick={() => selectNode(null)} title="Close" style={{ background: 'none', border: 'none', color: COLORS.textMuted, cursor: 'pointer', display: 'flex', padding: 4 }}>
+                  <X size={16} />
+                </button>
+              </div>
+              <div style={{ fontSize: 11, color: COLORS.textMuted, textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 }}>Name</div>
+              <input
+                value={selectedNode.name}
+                onChange={(e) => renameNode(selectedNode, e.target.value)}
+                style={{ width: '100%', border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: '8px 10px', fontSize: 14, marginBottom: 16, background: COLORS.surface }}
+              />
+              <span style={{ display: 'inline-block', fontSize: 11, padding: '3px 9px', borderRadius: 4, fontWeight: 600, marginBottom: 16, background: selectedNode.type === 'cat' ? COLORS.jadeSoft : COLORS.violetSoft, color: selectedNode.type === 'cat' ? COLORS.jade : COLORS.violet }}>
+                {selectedNode.type === 'cat' ? 'Category' : 'Item'}
+              </span>
+              <div style={{ fontSize: 12, color: COLORS.textMuted, marginBottom: 16, fontFamily: "'IBM Plex Mono', monospace" }}>{breadcrumb}</div>
+
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 11, color: COLORS.textMuted, textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 6 }}>Attributes</div>
+                {attributeDefs.length === 0 && <div style={{ color: COLORS.textMuted, fontSize: 12.5, marginBottom: 8 }}>No attributes defined for this dimension yet.</div>}
+                {attributeDefs.map((def) => (
+                  <div key={def} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                    <span style={{ width: 80, flexShrink: 0, fontSize: 11.5, color: COLORS.textMuted }}>{def}</span>
+                    <input
+                      value={(selectedNode.attrs && selectedNode.attrs[def]) || ''}
+                      onChange={(e) => setAttrValue(selectedNode, def, e.target.value)}
+                      placeholder="—"
+                      style={{ flex: 1, minWidth: 0, border: `1px solid ${COLORS.border}`, borderRadius: 6, padding: '6px 8px', fontSize: 12.5, background: COLORS.surface }}
+                    />
+                    <button onClick={() => removeAttributeDef(def)} title="Remove this attribute from the whole dimension" style={{ background: 'none', border: 'none', color: COLORS.textMuted, cursor: 'pointer', display: 'flex', padding: 2, flexShrink: 0 }}>
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                ))}
+                <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                  <input
+                    value={newAttrName}
+                    onChange={(e) => setNewAttrName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') addAttributeDef(); }}
+                    placeholder="New attribute name"
+                    style={{ flex: 1, border: `1px dashed ${COLORS.border}`, borderRadius: 6, padding: '6px 8px', fontSize: 12, background: 'transparent' }}
+                  />
+                  <button onClick={addAttributeDef} style={{ background: COLORS.violetSoft, color: COLORS.violet, border: 'none', borderRadius: 6, padding: '0 10px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Add</button>
+                </div>
+              </div>
+
+              <div style={{ fontSize: 12, color: COLORS.textMuted, background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: '10px 12px', marginBottom: 16, lineHeight: 1.5 }}>
+                {usageCount === null ? 'Checking usage…' : (
+                  <>Used in <b style={{ color: COLORS.textDark, fontFamily: "'IBM Plex Mono', monospace" }}>{usageCount}</b> real budget cells.</>
+                )}
+              </div>
+
+              {selectedNode.id === tree.id ? (
+                <div style={{ color: COLORS.textMuted, fontSize: 12.5 }}>{selectedNode.name} is the root of the {currentDim} dimension and can't be deleted.</div>
+              ) : !confirmingDelete ? (
+                <button onClick={() => setConfirmingDelete(true)} style={{ width: '100%', background: COLORS.brickSoft, color: COLORS.brick, border: 'none', borderRadius: 8, padding: 9, fontSize: 13, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6 }}>
+                  <Trash2 size={14} /> Delete
+                </button>
+              ) : (
+                <div style={{ background: COLORS.brick, color: '#fff', borderRadius: 8, padding: '10px 12px', fontSize: 12, lineHeight: 1.5 }}>
+                  This removes "{selectedNode.name}"{selectedNode.type === 'cat' && selectedNode.children.length ? ' and everything inside it' : ''} from the hierarchy. Real budget data stays intact — only this structural metadata is deleted.
+                  <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                    <button onClick={deleteSelected} style={{ flex: 1, background: '#fff', color: COLORS.brick, border: 'none', borderRadius: 6, padding: 7, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Yes, delete</button>
+                    <button onClick={() => setConfirmingDelete(false)} style={{ flex: 1, background: 'rgba(255,255,255,.18)', color: '#fff', border: 'none', borderRadius: 6, padding: 7, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Cancel</button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
