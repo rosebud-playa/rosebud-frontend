@@ -3,7 +3,7 @@ import { BrowserRouter, Routes, Route, useLocation, useNavigate } from 'react-ro
 import * as XLSX from 'xlsx';
 import {
   ChevronRight, ChevronDown, Save, RotateCcw, Trash2, X, ArrowLeftRight, History, Eye, EyeOff, Download, Archive,
-  Plus, Edit3, GripVertical, Search, Network,
+  Plus, Edit3, GripVertical, Search, Network, Activity as ActivityIcon,
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
@@ -87,6 +87,14 @@ const ACCOUNTS = [
   { id: 'travel', name: 'Travel & Entertainment', parentId: 'expenses', type: 'input', unit: '$' },
 ];
 const ACCOUNTS_BY_ID = Object.fromEntries(ACCOUNTS.map((a) => [a.id, a]));
+// Accounts sensible to pick as a standalone report metric when Account isn't
+// the row axis — excludes driver rows (units_sold, unit_price, headcount,
+// avg_salary), which only make sense nested under their formula parent.
+const PIVOT_ACCOUNT_OPTIONS = ACCOUNTS.filter((a) => !a.isDriver);
+// When Product is the row axis, only accounts that actually vary by product
+// are meaningful to pick — everything else would show an identical value on
+// every product row, which is confusing rather than wrong.
+const PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS = ACCOUNTS.filter((a) => a.id === 'product_revenue' || PRODUCT_DIMENSIONED_ACCOUNTS.includes(a.id));
 
 /* ----------------------------------------------------------------------
    MODEL ENGINE  (pure functions — operate on a plain data object)
@@ -198,6 +206,28 @@ function rowNameStyle(account) {
   return { fontWeight: 400 };
 }
 
+// A pill-shaped "chip" wrapping a real <select> (kept native for accessibility
+// and keyboard support — only the visual chrome is custom). Called inline as
+// a plain function, not rendered as a component, so it never remounts.
+function chipSelect(label, value, onChange, optionsNode, opts) {
+  return (
+    <div
+      title={opts?.title}
+      style={{ display: 'flex', alignItems: 'center', gap: 6, background: COLORS.bgChrome2, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 999, padding: '5px 12px 5px 12px' }}
+    >
+      <span style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: '.06em', color: COLORS.textOnDarkMuted, textTransform: 'uppercase' }}>{label}</span>
+      <select
+        className="lw-select"
+        value={value}
+        onChange={onChange}
+        style={{ background: 'none', color: COLORS.textOnDark, border: 'none', fontSize: 12.5, fontWeight: 600, cursor: 'pointer', outline: 'none' }}
+      >
+        {optionsNode}
+      </select>
+    </div>
+  );
+}
+
 /* ----------------------------------------------------------------------
    APP
 ---------------------------------------------------------------------- */
@@ -208,6 +238,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const showMembers = location.pathname === '/members';
   const showBackups = location.pathname === '/backups';
   const showHierarchy = location.pathname === '/hierarchy';
+  const showActivity = location.pathname === '/activity';
 
   const [values, setValues] = useState({});
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
@@ -216,6 +247,8 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const [currentScenario, setCurrentScenario] = useState('Budget');
   const [currentEntity, setCurrentEntity] = useState('company');
   const [currentProduct, setCurrentProduct] = useState('all');
+  const [rowDimension, setRowDimension] = useState('account'); // 'account' | 'entity' | 'product'
+  const [pivotAccount, setPivotAccount] = useState('revenue');
   const [granularity, setGranularity] = useState('Monthly');
   const [expanded, setExpanded] = useState(() => new Set(['revenue', 'expenses']));
   const [compareMode, setCompareMode] = useState(false);
@@ -226,6 +259,8 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const [role, setRole] = useState('viewer');
   const [myWorkspaces, setMyWorkspaces] = useState([]);
   const [members, setMembers] = useState([]);
+  const [activityEntries, setActivityEntries] = useState([]);
+  const [activityLoading, setActivityLoading] = useState(false);
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState('editor');
   const [membersError, setMembersError] = useState('');
@@ -267,6 +302,13 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       .then((r) => r.json())
       .then((data) => setMembers(data.members || []))
       .catch(() => {});
+  }
+  function loadActivity() {
+    setActivityLoading(true);
+    fetch(`${API_BASE}/workspace/activity`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => r.json())
+      .then((data) => { setActivityEntries(data.entries || []); setActivityLoading(false); })
+      .catch(() => setActivityLoading(false));
   }
   function sendInvite() {
     setMembersError('');
@@ -417,20 +459,20 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
     });
   }
 
-  function updateValue(accountId, month, raw) {
+  function updateValue(entityId, accountId, month, raw, productOverride) {
     const num = raw === '' ? 0 : parseFloat(raw);
     const value = isNaN(num) ? 0 : num;
-    const productKey = PRODUCT_DIMENSIONED_ACCOUNTS.includes(accountId) ? currentProduct : 'none';
+    const productKey = PRODUCT_DIMENSIONED_ACCOUNTS.includes(accountId) ? (productOverride ?? currentProduct) : 'none';
 
     // Optimistic local update so typing feels instant.
     setValues((prev) => {
       const next = { ...prev };
       const scen = { ...next[currentScenario] };
-      const ent = { ...scen[currentEntity] };
+      const ent = { ...scen[entityId] };
       const accData = { ...ent[accountId] };
       accData[productKey] = { ...accData[productKey], [month]: value };
       ent[accountId] = accData;
-      scen[currentEntity] = ent;
+      scen[entityId] = ent;
       next[currentScenario] = scen;
       return next;
     });
@@ -439,7 +481,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
     fetch(`${API_BASE}/cell`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ scenario: currentScenario, entity: currentEntity, account: accountId, month, value, product: productKey }),
+      body: JSON.stringify({ scenario: currentScenario, entity: entityId, account: accountId, month, value, product: productKey }),
     })
       .then((r) => { if (!r.ok) throw new Error('save failed'); setSaveStatus('saved'); })
       .catch(() => setSaveStatus('error'));
@@ -508,15 +550,19 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   }
 
   const canEdit = canEditData && currentEntity !== 'company' && granularity === 'Monthly' && !compareMode;
+  // When Entity is the row axis, its filter chip is hidden — fall back to the
+  // company-wide total for KPIs/chart rather than showing a stale, no-longer-
+  // visible entity selection.
+  const kpiEntityContext = rowDimension === 'entity' ? 'company' : currentEntity;
 
-  const kpiRevenue = getPeriodValue(liveData, currentEntity, 'revenue', 'FY');
-  const kpiExpenses = getPeriodValue(liveData, currentEntity, 'expenses', 'FY');
+  const kpiRevenue = getPeriodValue(liveData, kpiEntityContext, 'revenue', 'FY');
+  const kpiExpenses = getPeriodValue(liveData, kpiEntityContext, 'expenses', 'FY');
   const kpiNet = kpiRevenue - kpiExpenses;
   const kpiMargin = kpiRevenue !== 0 ? (kpiNet / kpiRevenue) * 100 : 0;
 
   const chartData = MONTHS.map((m) => {
-    const rev = getValueAt(liveData, currentEntity, 'revenue', m);
-    const exp = getValueAt(liveData, currentEntity, 'expenses', m);
+    const rev = getValueAt(liveData, kpiEntityContext, 'revenue', m);
+    const exp = getValueAt(liveData, kpiEntityContext, 'expenses', m);
     return { month: m, Revenue: rev, Expenses: exp, 'Net Income': rev - exp };
   });
 
@@ -590,6 +636,16 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             >
               Members
             </button>
+            <button
+              onClick={() => { if (showActivity) navigate('/'); else { navigate('/activity'); loadActivity(); } }}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6, padding: '5px 10px', borderRadius: 6, fontSize: 12.5,
+                background: showActivity ? COLORS.violet : 'none', color: showActivity ? '#fff' : COLORS.textOnDarkMuted,
+                border: `1px solid ${showActivity ? COLORS.violet : COLORS.chromeBorder}`, cursor: 'pointer',
+              }}
+            >
+              <ActivityIcon size={13} /> Activity
+            </button>
             {canManageBackups && (
               <button
                 onClick={() => { if (showBackups) navigate('/'); else { navigate('/backups'); loadBackups(); } }}
@@ -627,38 +683,41 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             >
               Log out
             </button>
-            <select
-              className="lw-select"
-              value={currentEntity}
-              onChange={(e) => setCurrentEntity(e.target.value)}
-              style={{ background: COLORS.bgChrome2, color: COLORS.textOnDark, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 6, padding: '6px 10px', fontSize: 13 }}
-            >
-              {ENTITY_OPTIONS.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
-            </select>
+            {chipSelect('Rows', rowDimension, (e) => {
+              const next = e.target.value;
+              setRowDimension(next);
+              if (next !== 'account') setCompareMode(false);
+              if (next === 'product' && !PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS.some((a) => a.id === pivotAccount)) setPivotAccount('product_revenue');
+            }, (
+              <>
+                <option value="account">Account</option>
+                <option value="entity">Entity</option>
+                <option value="product">Product</option>
+              </>
+            ))}
 
-            <select
-              className="lw-select"
-              value={currentProduct}
-              onChange={(e) => setCurrentProduct(e.target.value)}
-              title="Filters Product Revenue, Units Sold, and Unit Price only — every other line always shows the full total."
-              style={{ background: COLORS.bgChrome2, color: COLORS.textOnDark, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 6, padding: '6px 10px', fontSize: 13 }}
-            >
-              <option value="all">All Products</option>
-              {PRODUCT_CATEGORIES.map((cat) => (
-                <optgroup key={cat.id} label={cat.name}>
-                  {PRODUCTS.filter((p) => p.category === cat.id).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-                </optgroup>
-              ))}
-            </select>
+            {rowDimension !== 'entity' && chipSelect('Entity', currentEntity, (e) => setCurrentEntity(e.target.value), (
+              ENTITY_OPTIONS.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)
+            ))}
 
-            <select
-              className="lw-select"
-              value={currentScenario}
-              onChange={(e) => setCurrentScenario(e.target.value)}
-              style={{ background: COLORS.bgChrome2, color: COLORS.textOnDark, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 6, padding: '6px 10px', fontSize: 13 }}
-            >
-              {SCENARIOS.map((s) => <option key={s} value={s}>{s}</option>)}
-            </select>
+            {rowDimension !== 'account' && chipSelect('Account', pivotAccount, (e) => setPivotAccount(e.target.value), (
+              (rowDimension === 'product' ? PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS : PIVOT_ACCOUNT_OPTIONS).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)
+            ))}
+
+            {rowDimension !== 'product' && chipSelect('Product', currentProduct, (e) => setCurrentProduct(e.target.value), (
+              <>
+                <option value="all">All Products</option>
+                {PRODUCT_CATEGORIES.map((cat) => (
+                  <optgroup key={cat.id} label={cat.name}>
+                    {PRODUCTS.filter((p) => p.category === cat.id).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  </optgroup>
+                ))}
+              </>
+            ), { title: 'Filters Product Revenue, Units Sold, and Unit Price only — every other line always shows the full total.' })}
+
+            {chipSelect('Scenario', currentScenario, (e) => setCurrentScenario(e.target.value), (
+              SCENARIOS.map((s) => <option key={s} value={s}>{s}</option>)
+            ))}
 
             <div style={{ background: COLORS.bgChrome2, border: `1px solid ${COLORS.chromeBorder}`, borderRadius: 6, padding: 2 }} className="flex">
               {['Monthly', 'Quarterly', 'Annual'].map((g) => (
@@ -677,15 +736,17 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
               ))}
             </div>
 
-            <button
-              onClick={() => setCompareMode((c) => !c)}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', borderRadius: 6, fontSize: 13,
-                background: compareMode ? COLORS.violet : COLORS.bgChrome2, color: '#fff', border: `1px solid ${compareMode ? COLORS.violet : COLORS.chromeBorder}`, cursor: 'pointer',
-              }}
-            >
-              <ArrowLeftRight size={14} /> Compare
-            </button>
+            {rowDimension === 'account' && (
+              <button
+                onClick={() => setCompareMode((c) => !c)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', borderRadius: 6, fontSize: 13,
+                  background: compareMode ? COLORS.violet : COLORS.bgChrome2, color: '#fff', border: `1px solid ${compareMode ? COLORS.violet : COLORS.chromeBorder}`, cursor: 'pointer',
+                }}
+              >
+                <ArrowLeftRight size={14} /> Compare
+              </button>
+            )}
 
             <button
               onClick={() => navigate(showVersions ? '/' : '/versions')}
@@ -765,13 +826,14 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
 
       {/* ---------------- Grid ---------------- */}
       <div className="px-6 pt-4 pb-2">
-        {!compareMode && (!canEdit || currentProduct === 'all') && (
+        {rowDimension === 'account' && !compareMode && (!canEdit || currentProduct === 'all') && (
           <div style={{ color: COLORS.textMuted }} className="text-xs mb-2">
             {currentEntity === 'company' && 'Select a specific entity to edit inputs. '}
             {granularity !== 'Monthly' && 'Switch to Monthly view to edit inputs. '}
             {currentProduct === 'all' && 'Select a specific product to edit Units Sold or Unit Price.'}
           </div>
         )}
+        {rowDimension === 'account' && (
         <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
           <div className="overflow-x-auto">
             <table style={{ minWidth: compareMode ? 640 : columns.length * 92 + 220, borderCollapse: 'collapse' }} className="w-full text-sm">
@@ -839,7 +901,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                                   type="number"
                                   className="lw-num lw-cell-input"
                                   value={liveData[currentEntity]?.[row.id]?.[productKey]?.[col] ?? 0}
-                                  onChange={(e) => updateValue(row.id, col, e.target.value)}
+                                  onChange={(e) => updateValue(currentEntity, row.id, col, e.target.value)}
                                 />
                               ) : (
                                 <span className="lw-num" style={{ fontSize: 12.5, fontWeight: col === 'FY' ? 600 : 400 }}>{fmtCell(row.unit, val)}</span>
@@ -923,9 +985,129 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             </table>
           </div>
         </div>
+        )}
+        {rowDimension === 'account' && (
         <div style={{ color: COLORS.textMuted }} className="text-xs mt-2">
           Rail colors: <span style={{ color: COLORS.jade }}>■</span> rollup &nbsp; <span style={{ color: COLORS.violet }}>■</span> formula &nbsp; <span style={{ color: COLORS.amber }}>■</span> driver input &nbsp; <span style={{ color: COLORS.border }}>■</span> input. Edits save to the shared workspace on the budget server as you type.
         </div>
+        )}
+
+        {rowDimension === 'entity' && (() => {
+          const isProductAcct = PRODUCT_DIMENSIONED_ACCOUNTS.includes(pivotAccount);
+          const isLeafInput = ACCOUNTS_BY_ID[pivotAccount]?.type === 'input';
+          const productKey = isProductAcct ? currentProduct : 'none';
+          return (
+            <>
+              {!canEditData || granularity !== 'Monthly' || !isLeafInput || (isProductAcct && currentProduct === 'all') ? (
+                <div style={{ color: COLORS.textMuted }} className="text-xs mb-2">
+                  {!isLeafInput && `"${ACCOUNTS_BY_ID[pivotAccount]?.name}" is a rollup or formula — pick a directly-entered line item to edit values. `}
+                  {isLeafInput && granularity !== 'Monthly' && 'Switch to Monthly view to edit inputs. '}
+                  {isLeafInput && isProductAcct && currentProduct === 'all' && 'Select a specific product to edit this line.'}
+                </div>
+              ) : null}
+              <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table style={{ minWidth: columns.length * 92 + 220, borderCollapse: 'collapse' }} className="w-full text-sm">
+                    <thead>
+                      <tr style={{ background: COLORS.bgChrome }}>
+                        <th style={{ position: 'sticky', left: 0, background: COLORS.bgChrome, color: COLORS.textOnDark, zIndex: 2 }} className="text-left px-3 py-2 text-xs font-medium whitespace-nowrap">Entity</th>
+                        {columns.map((c) => (
+                          <th key={c} style={{ color: c === 'FY' ? '#fff' : COLORS.textOnDarkMuted, background: c === 'FY' ? '#232B3D' : 'transparent' }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">{c}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ENTITIES.map((ent) => (
+                        <tr key={ent.id} className="lw-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
+                          <td style={{ position: 'sticky', left: 0, background: COLORS.surface, zIndex: 1 }} className="px-3 py-1.5 whitespace-nowrap text-sm">{ent.name}</td>
+                          {columns.map((col) => {
+                            const val = getPeriodValue(liveData, ent.id, pivotAccount, col, currentProduct);
+                            const editableHere = canEditData && isLeafInput && MONTHS.includes(col) && granularity === 'Monthly' && (!isProductAcct || currentProduct !== 'all') && !compareMode;
+                            return (
+                              <td key={col} style={{ background: col === 'FY' ? COLORS.surfaceAlt : COLORS.surface }} className="px-3 py-1.5 text-right">
+                                {editableHere ? (
+                                  <input type="number" className="lw-num lw-cell-input" value={liveData[ent.id]?.[pivotAccount]?.[productKey]?.[col] ?? 0} onChange={(e) => updateValue(ent.id, pivotAccount, col, e.target.value)} />
+                                ) : (
+                                  <span className="lw-num" style={{ fontSize: 12.5, fontWeight: col === 'FY' ? 600 : 400 }}>{fmtCell(ACCOUNTS_BY_ID[pivotAccount]?.unit || '$', val)}</span>
+                                )}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                      <tr style={{ borderTop: `2px solid ${COLORS.textDark}` }}>
+                        <td style={{ position: 'sticky', left: 0, background: '#1C2333', color: '#fff', zIndex: 1 }} className="px-3 py-2 font-bold whitespace-nowrap text-sm">Company (Total)</td>
+                        {columns.map((col) => (
+                          <td key={col} className="px-3 py-2 text-right lw-num font-semibold" style={{ fontSize: 12.5, background: COLORS.violet, color: '#fff' }}>
+                            {fmtCell(ACCOUNTS_BY_ID[pivotAccount]?.unit || '$', getPeriodValue(liveData, 'company', pivotAccount, col, currentProduct))}
+                          </td>
+                        ))}
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          );
+        })()}
+
+        {rowDimension === 'product' && (() => {
+          const isProductAcct = PRODUCT_DIMENSIONED_ACCOUNTS.includes(pivotAccount);
+          const isLeafInput = ACCOUNTS_BY_ID[pivotAccount]?.type === 'input';
+          return (
+            <>
+              {!canEditData || granularity !== 'Monthly' || !isLeafInput || !isProductAcct || currentEntity === 'company' ? (
+                <div style={{ color: COLORS.textMuted }} className="text-xs mb-2">
+                  {!isProductAcct && `"${ACCOUNTS_BY_ID[pivotAccount]?.name}" doesn't vary by product, so these rows show the same value for reference — pick Units Sold or Unit Price to edit. `}
+                  {isProductAcct && granularity !== 'Monthly' && 'Switch to Monthly view to edit inputs. '}
+                  {isProductAcct && currentEntity === 'company' && 'Select a specific entity to edit inputs.'}
+                </div>
+              ) : null}
+              <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table style={{ minWidth: columns.length * 92 + 220, borderCollapse: 'collapse' }} className="w-full text-sm">
+                    <thead>
+                      <tr style={{ background: COLORS.bgChrome }}>
+                        <th style={{ position: 'sticky', left: 0, background: COLORS.bgChrome, color: COLORS.textOnDark, zIndex: 2 }} className="text-left px-3 py-2 text-xs font-medium whitespace-nowrap">Product</th>
+                        {columns.map((c) => (
+                          <th key={c} style={{ color: c === 'FY' ? '#fff' : COLORS.textOnDarkMuted, background: c === 'FY' ? '#232B3D' : 'transparent' }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">{c}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {PRODUCTS.map((prod) => (
+                        <tr key={prod.id} className="lw-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
+                          <td style={{ position: 'sticky', left: 0, background: COLORS.surface, zIndex: 1 }} className="px-3 py-1.5 whitespace-nowrap text-sm">{prod.name}</td>
+                          {columns.map((col) => {
+                            const val = getPeriodValue(liveData, currentEntity, pivotAccount, col, prod.id);
+                            const editableHere = canEditData && isLeafInput && isProductAcct && MONTHS.includes(col) && granularity === 'Monthly' && currentEntity !== 'company' && !compareMode;
+                            return (
+                              <td key={col} style={{ background: col === 'FY' ? COLORS.surfaceAlt : COLORS.surface }} className="px-3 py-1.5 text-right">
+                                {editableHere ? (
+                                  <input type="number" className="lw-num lw-cell-input" value={liveData[currentEntity]?.[pivotAccount]?.[prod.id]?.[col] ?? 0} onChange={(e) => updateValue(currentEntity, pivotAccount, col, e.target.value, prod.id)} />
+                                ) : (
+                                  <span className="lw-num" style={{ fontSize: 12.5, fontWeight: col === 'FY' ? 600 : 400 }}>{fmtCell(ACCOUNTS_BY_ID[pivotAccount]?.unit || '$', val)}</span>
+                                )}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                      <tr style={{ borderTop: `2px solid ${COLORS.textDark}` }}>
+                        <td style={{ position: 'sticky', left: 0, background: '#1C2333', color: '#fff', zIndex: 1 }} className="px-3 py-2 font-bold whitespace-nowrap text-sm">All Products (Total)</td>
+                        {columns.map((col) => (
+                          <td key={col} className="px-3 py-2 text-right lw-num font-semibold" style={{ fontSize: 12.5, background: COLORS.violet, color: '#fff' }}>
+                            {fmtCell(ACCOUNTS_BY_ID[pivotAccount]?.unit || '$', getPeriodValue(liveData, currentEntity, pivotAccount, col, 'all'))}
+                          </td>
+                        ))}
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          );
+        })()}
       </div>
       </>
       )}
@@ -941,6 +1123,39 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             </div>
           </div>
         )
+      )}
+
+      {/* ---------------- Activity page ---------------- */}
+      {showActivity && (
+        <div className="px-6 pt-4 pb-6">
+          <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 10, padding: 20 }}>
+            <div className="flex items-center justify-between mb-1">
+              <div className="font-semibold text-sm">Workspace activity</div>
+            </div>
+            <div style={{ color: COLORS.textMuted }} className="text-xs mb-4">
+              Invites, role changes, version and backup saves/restores, and hierarchy edits. Routine cell edits aren't logged here to keep this readable.
+            </div>
+            {activityLoading ? (
+              <div style={{ color: COLORS.textMuted }} className="text-xs">Loading…</div>
+            ) : activityEntries.length === 0 ? (
+              <div style={{ color: COLORS.textMuted }} className="text-xs">No activity yet.</div>
+            ) : (
+              <div className="flex flex-col">
+                {activityEntries.map((e) => (
+                  <div key={e.id} style={{ borderBottom: `1px solid ${COLORS.border}`, padding: '9px 0' }} className="flex items-start justify-between gap-4">
+                    <div className="text-sm">
+                      <span style={{ fontWeight: 600 }}>{e.userEmail}</span>{' '}
+                      <span style={{ color: COLORS.textMuted }}>{e.action}</span>
+                    </div>
+                    <div style={{ color: COLORS.textMuted, fontFamily: "'IBM Plex Mono', monospace", whiteSpace: 'nowrap', fontSize: 11.5 }}>
+                      {new Date(e.createdAt).toLocaleString()}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       )}
 
       {/* ---------------- Versions drawer ---------------- */}
@@ -1464,7 +1679,7 @@ function HierarchyEditor({ token }) {
               <option>Accounts</option>
               <option>Entities</option>
             </select>
-            <div style={{ position: 'relative', flex: 1 }}>
+            <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
               <Search size={14} style={{ position: 'absolute', left: 10, top: 9, color: COLORS.textMuted }} />
               <input value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} placeholder="Filter..." style={{ width: '100%', border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: '8px 12px 8px 32px', fontSize: 13 }} />
             </div>
