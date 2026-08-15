@@ -176,21 +176,39 @@ function pivotColumnHeaderRows(tree) {
     if (!nodes || nodes.length === 0) return;
     rows[level] = rows[level] || [];
     nodes.forEach((node) => {
-      rows[level].push({ name: node.name, isTotal: node.isTotal, colSpan: countPivotLeaves(node) });
+      rows[level].push({ name: node.name, isTotal: node.isTotal, colSpan: countPivotLeaves(node), path: node.path, hadChildren: !!node.hadChildren || !!node.children });
       if (node.children) walk(node.children, level + 1);
     });
   })(tree, 0);
   return rows;
 }
-// Display name for a given (dimension, member id) pair, independent of any
-// tree position — used in Tabular Form where every nested level gets its own
-// column, so a leaf row needs each ancestor's name individually, not just
-// the innermost one a tree node would carry.
-function pivotMemberName(dim, id, granularity) {
-  const meta = PIVOT_DIMENSIONS[dim];
-  if (meta?.hasTotal && id === meta.totalId) return meta.totalName;
-  const found = pivotMembers(dim, granularity).find((m) => m.id === id);
-  return found ? found.name : id;
+// Returns a copy of the tree where any node whose path-key is in
+// `collapsedSet` has its children stripped — collapsing it into a single
+// leaf for colspan/flatten purposes, while remembering `hadChildren` so the
+// header can still show a clickable chevron for it.
+function pruneCollapsedPivotTree(nodes, collapsedSet) {
+  if (!nodes) return nodes;
+  return nodes.map((node) => {
+    const key = JSON.stringify(node.path);
+    if (collapsedSet.has(key)) return { ...node, children: null, hadChildren: true };
+    return { ...node, children: node.children ? pruneCollapsedPivotTree(node.children, collapsedSet) : null, hadChildren: !!node.children };
+  });
+}
+// Fills in any dimension in `dimOrder` missing from `path` with its "all
+// members" total id, so a collapsed/group node can show a real rolled-up
+// value instead of a blank. Returns null if a missing dimension has no such
+// total (Account, Scenario) — rolling those up flatly would be misleading,
+// so the caller shows "—" instead.
+function rollupPathFor(path, dimOrder) {
+  const filled = { ...path };
+  for (const dim of dimOrder) {
+    if (!(dim in filled)) {
+      const meta = PIVOT_DIMENSIONS[dim];
+      if (meta?.hasTotal) filled[dim] = meta.totalId;
+      else return null;
+    }
+  }
+  return filled;
 }
 
 /* ----------------------------------------------------------------------
@@ -1245,41 +1263,35 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             if ('account' in combined) return ACCOUNTS_BY_ID[combined.account]?.unit || '$';
             return ACCOUNTS_BY_ID[filterAccount]?.unit || '$';
           }
-          // A group-header row (e.g. "Revenue" before drilling into Product)
-          // still shows a real rolled-up number, matching TM1 — not a blank
-          // row. Any row-axis dimension not yet reached by this node's path
-          // gets filled with its "all members" total id. If a not-yet-reached
-          // dimension has no such total (Account, Scenario — summing those
-          // flatly would double-count or make no sense), the roll-up is
-          // honestly shown as "—" rather than a misleading number.
-          function rollupPathFor(node) {
-            const filled = { ...node.path };
-            for (const dim of rowsOrder) {
-              if (!(dim in filled)) {
-                const meta = PIVOT_DIMENSIONS[dim];
-                if (meta?.hasTotal) filled[dim] = meta.totalId;
-                else return null;
-              }
-            }
-            return filled;
-          }
           const bodyFont = { fontFamily: "'IBM Plex Sans', sans-serif" };
 
-          const colTree = buildPivotTree(colsOrder, granularity, {});
+          // Both axes prune through the SAME collapsed-path set — collapsing
+          // a node (row or column) strips its children for colspan/leaf
+          // purposes while remembering it had them, so the header keeps a
+          // clickable chevron and the cell shows a real rolled-up value
+          // (via rollupPathFor) instead of going blank.
+          const rawColTree = buildPivotTree(colsOrder, granularity, {});
+          const colTree = pruneCollapsedPivotTree(rawColTree, pivotCollapsed);
           const colHeaderLevels = pivotColumnHeaderRows(colTree);
           const colLeaves = flattenPivotLeaves(colTree);
           const rowTree = buildPivotTree(rowsOrder, granularity, {});
 
+          function cellValue(rowPath, rowHadChildren, colPath, colHadChildren) {
+            const effRow = rowHadChildren ? rollupPathFor(rowPath, rowsOrder) : rowPath;
+            const effCol = colHadChildren ? rollupPathFor(colPath, colsOrder) : colPath;
+            if (!effRow || !effCol) return null;
+            return valueAt(effRow, effCol);
+          }
+
           function renderPivotRowNode(node, depth) {
             const key = JSON.stringify(node.path);
             const isExpanded = !pivotCollapsed.has(key);
-            const rowPath = node.children ? rollupPathFor(node) : node.path;
             const isTotalStyle = node.isTotal;
             return (
               <React.Fragment key={key}>
                 <tr
                   className={node.children ? undefined : 'lw-row'}
-                  style={{ borderTop: `1px solid ${COLORS.border}`, background: node.children ? COLORS.surfaceAlt : undefined, cursor: node.children ? 'pointer' : undefined }}
+                  style={{ borderTop: `1px solid ${COLORS.border}`, background: node.children ? COLORS.surfaceAlt : COLORS.surface, cursor: node.children ? 'pointer' : undefined }}
                   onClick={node.children ? () => togglePivotExpand(node.path) : undefined}
                 >
                   <td
@@ -1291,19 +1303,23 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                     className="px-3 py-1.5 whitespace-nowrap text-sm"
                   >
                     <div style={{ paddingLeft: depth * 18, display: 'flex', alignItems: 'center', gap: 6, fontWeight: node.children ? 700 : (isTotalStyle ? 700 : 400) }}>
-                      {node.children ? (isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />) : <span style={{ width: 13 }} />}
+                      {node.children ? (isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />) : <span style={{ width: 13, flexShrink: 0 }} />}
                       {node.name}
                     </div>
                   </td>
-                  {colLeaves.map((c) => (
-                    <td key={JSON.stringify(c.path)} className="px-3 py-1.5 text-right" style={{ background: isTotalStyle ? COLORS.violet : (node.children ? COLORS.surfaceAlt : (c.isTotal ? COLORS.surfaceAlt : undefined)), color: isTotalStyle ? '#fff' : undefined }}>
-                      {rowPath ? (
-                        <span className="lw-num" style={{ fontSize: 12.5, fontWeight: (isTotalStyle || c.isTotal || node.children) ? 600 : 400 }}>{fmtCell(unitFor(rowPath, c.path), valueAt(rowPath, c.path))}</span>
-                      ) : (
-                        <span style={{ color: COLORS.textMuted, fontSize: 12.5 }}>—</span>
-                      )}
-                    </td>
-                  ))}
+                  {colLeaves.map((c) => {
+                    const val = cellValue(node.path, !!node.children, c.path, c.hadChildren);
+                    const cellBg = isTotalStyle ? COLORS.violet : (node.children ? COLORS.surfaceAlt : (c.isTotal || c.hadChildren ? COLORS.surfaceAlt : COLORS.surface));
+                    return (
+                      <td key={JSON.stringify(c.path)} className="px-3 py-1.5 text-right" style={{ background: cellBg, color: isTotalStyle ? '#fff' : undefined }}>
+                        {val === null ? (
+                          <span style={{ color: COLORS.textMuted, fontSize: 12.5 }}>—</span>
+                        ) : (
+                          <span className="lw-num" style={{ fontSize: 12.5, fontWeight: (isTotalStyle || c.isTotal || node.children || c.hadChildren) ? 600 : 400 }}>{fmtCell(unitFor(node.path, c.path), val)}</span>
+                        )}
+                      </td>
+                    );
+                  })}
                 </tr>
                 {node.children && isExpanded && node.children.map((child) => renderPivotRowNode(child, depth + 1))}
               </React.Fragment>
@@ -1327,8 +1343,17 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                           </th>
                         )}
                         {levelCells.map((cell, i) => (
-                          <th key={i} colSpan={cell.colSpan} style={{ color: cell.isTotal ? '#fff' : COLORS.textOnDarkMuted, background: cell.isTotal ? '#232B3D' : 'transparent', ...bodyFont }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">
-                            {cell.name}
+                          <th
+                            key={i}
+                            colSpan={cell.colSpan}
+                            onClick={cell.hadChildren ? () => togglePivotExpand(cell.path) : undefined}
+                            style={{ color: cell.isTotal ? '#fff' : COLORS.textOnDarkMuted, background: cell.isTotal ? '#232B3D' : 'transparent', cursor: cell.hadChildren ? 'pointer' : undefined, ...bodyFont }}
+                            className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap"
+                          >
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                              {cell.name}
+                              {cell.hadChildren && (pivotCollapsed.has(JSON.stringify(cell.path)) ? <ChevronRight size={12} /> : <ChevronDown size={12} />)}
+                            </span>
                           </th>
                         ))}
                       </tr>
@@ -1340,7 +1365,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                 </table>
               </div>
               <div className="text-xs px-3 py-2 border-t" style={{ color: COLORS.textMuted, borderColor: COLORS.border }}>
-                Read-only in this arrangement. Switch Rows to Account and Columns to Time (nothing nested) to edit values.
+                Read-only in this arrangement. Switch Rows to Account and Columns to Time (nothing nested) to edit values. Click any column header with an arrow to collapse it.
               </div>
             </div>
           );
@@ -1348,6 +1373,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       </div>
       </>
       )}
+
 
 
 
