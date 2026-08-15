@@ -138,16 +138,21 @@ function getPivotCellValue(allScenarioValues, scenario, entityId, accountId, per
 // full {dim: id} map from the root down to that node — which is exactly what
 // a cell needs to resolve its value. Any dimension in `dims` beyond the
 // first becomes nested children of every member (and Total, where that
-// dimension has one) at the level above.
-function buildPivotTree(dims, granularity, pathSoFar) {
+// dimension has one) at the level above. `subsets` is an optional
+// {dim: Set(memberIds)} map — when a dimension has one, only its selected
+// members (and Total, if included) appear; dimensions with no entry show
+// everything, same as before subsets existed.
+function buildPivotTree(dims, granularity, pathSoFar, subsets) {
   if (dims.length === 0) return null;
   const [dim, ...rest] = dims;
   const meta = PIVOT_DIMENSIONS[dim];
-  const members = pivotMembers(dim, granularity).map((m) => ({ id: m.id, name: m.name, isTotal: false }));
+  const subset = subsets && subsets[dim];
+  let members = pivotMembers(dim, granularity).map((m) => ({ id: m.id, name: m.name, isTotal: false }));
   if (meta?.hasTotal) members.push({ id: meta.totalId, name: meta.totalName, isTotal: true });
+  if (subset) members = members.filter((m) => subset.has(m.id));
   return members.map((m) => {
     const path = { ...pathSoFar, [dim]: m.id };
-    return { dim, id: m.id, name: m.name, isTotal: m.isTotal, path, children: rest.length ? buildPivotTree(rest, granularity, path) : null };
+    return { dim, id: m.id, name: m.name, isTotal: m.isTotal, path, children: rest.length ? buildPivotTree(rest, granularity, path, subsets) : null };
   });
 }
 // Number of leaf columns/rows a node ultimately expands into — used as the
@@ -372,6 +377,12 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const [filterAccount, setFilterAccount] = useState('revenue');
   const [filterTime, setFilterTime] = useState('FY');
   const [dragChip, setDragChip] = useState(null);
+  // { [dim]: Set(memberIds) } — a dimension only appears here once the user
+  // has actually customized its subset; absence means "show everything",
+  // same as before this feature existed.
+  const [pivotSubsets, setPivotSubsets] = useState({});
+  const [subsetEditorDim, setSubsetEditorDim] = useState(null);
+  const [subsetEditorDraft, setSubsetEditorDraft] = useState(null);
   const [pivotCollapsed, setPivotCollapsed] = useState(() => new Set());
   const [granularity, setGranularity] = useState('Monthly');
   const [expanded, setExpanded] = useState(() => new Set(['revenue', 'expenses']));
@@ -609,50 +620,89 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
     setPivotCollapsed((prev) => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
   }
 
+  // The full member list (including Total, where applicable) for a
+  // dimension — what the subset editor's checklist is built from.
+  function subsetAllMembers(dim) {
+    const meta = PIVOT_DIMENSIONS[dim];
+    const members = pivotMembers(dim, granularity).map((m) => ({ id: m.id, name: m.name }));
+    if (meta?.hasTotal) members.push({ id: meta.totalId, name: meta.totalName });
+    return members;
+  }
+  function openSubsetEditor(dim) {
+    const allIds = subsetAllMembers(dim).map((m) => m.id);
+    const current = pivotSubsets[dim];
+    setSubsetEditorDraft(new Set(current ? [...current] : allIds));
+    setSubsetEditorDim(dim);
+  }
+  function toggleSubsetDraftMember(id) {
+    setSubsetEditorDraft((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  }
+  function applySubsetEditor() {
+    const allIds = subsetAllMembers(subsetEditorDim).map((m) => m.id);
+    const isFullSet = allIds.length === subsetEditorDraft.size && allIds.every((id) => subsetEditorDraft.has(id));
+    setPivotSubsets((prev) => {
+      const next = { ...prev };
+      if (isFullSet) delete next[subsetEditorDim];
+      else next[subsetEditorDim] = subsetEditorDraft;
+      return next;
+    });
+    setSubsetEditorDim(null);
+    setSubsetEditorDraft(null);
+  }
+  function closeSubsetEditor() {
+    setSubsetEditorDim(null);
+    setSubsetEditorDraft(null);
+  }
+
   // The small value-picker embedded in a chip when that dimension is sitting
   // in the Filter zone. stopPropagation on mousedown keeps clicking the
   // select from being interpreted as the start of a drag.
   function renderFilterValuePicker(dim) {
     const stop = (e) => e.stopPropagation();
     const style = { background: 'none', border: 'none', color: 'inherit', fontWeight: 700, fontSize: 12, cursor: 'pointer', outline: 'none' };
+    const subset = pivotSubsets[dim];
+    const inSubset = (id) => !subset || subset.has(id);
     if (dim === 'entity') {
       return (
         <select value={currentEntity} onChange={(e) => setCurrentEntity(e.target.value)} onMouseDown={stop} className="lw-select" style={style}>
-          {ENTITY_OPTIONS.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
+          {ENTITY_OPTIONS.filter((e) => inSubset(e.id)).map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
         </select>
       );
     }
     if (dim === 'product') {
       return (
         <select value={currentProduct} onChange={(e) => setCurrentProduct(e.target.value)} onMouseDown={stop} className="lw-select" style={style}>
-          <option value="all">All</option>
-          {PRODUCT_CATEGORIES.map((cat) => (
-            <optgroup key={cat.id} label={cat.name}>
-              {PRODUCTS.filter((p) => p.category === cat.id).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-            </optgroup>
-          ))}
+          {inSubset('all') && <option value="all">All</option>}
+          {PRODUCT_CATEGORIES.map((cat) => {
+            const inCat = PRODUCTS.filter((p) => p.category === cat.id && inSubset(p.id));
+            return inCat.length ? (
+              <optgroup key={cat.id} label={cat.name}>
+                {inCat.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </optgroup>
+            ) : null;
+          })}
         </select>
       );
     }
     if (dim === 'account') {
-      const options = (rowsOrder.includes('product') || colsOrder.includes('product')) ? PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS : PIVOT_ACCOUNT_OPTIONS;
+      const baseOptions = (rowsOrder.includes('product') || colsOrder.includes('product')) ? PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS : PIVOT_ACCOUNT_OPTIONS;
       return (
         <select value={filterAccount} onChange={(e) => setFilterAccount(e.target.value)} onMouseDown={stop} className="lw-select" style={style}>
-          {options.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+          {baseOptions.filter((a) => inSubset(a.id)).map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
         </select>
       );
     }
     if (dim === 'scenario') {
       return (
         <select value={currentScenario} onChange={(e) => setCurrentScenario(e.target.value)} onMouseDown={stop} className="lw-select" style={style}>
-          {SCENARIOS.map((s) => <option key={s} value={s}>{s}</option>)}
+          {SCENARIOS.filter((s) => inSubset(s)).map((s) => <option key={s} value={s}>{s}</option>)}
         </select>
       );
     }
     if (dim === 'time') {
       return (
         <select value={filterTime} onChange={(e) => setFilterTime(e.target.value)} onMouseDown={stop} className="lw-select" style={style}>
-          {[...MONTHS, 'Q1', 'Q2', 'Q3', 'Q4', 'FY'].map((p) => <option key={p} value={p}>{p}</option>)}
+          {[...MONTHS, 'Q1', 'Q2', 'Q3', 'Q4', 'FY'].filter((p) => inSubset(p)).map((p) => <option key={p} value={p}>{p}</option>)}
         </select>
       );
     }
@@ -784,7 +834,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   ].filter((o) => o.key !== currentScenario || o.key.startsWith('v:'));
 
   return (
-    <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", background: COLORS.surfaceAlt, color: COLORS.textDark, minHeight: '100%' }} className="w-full">
+    <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", background: COLORS.surfaceAlt, color: COLORS.textDark, minHeight: '100%', overflowX: 'hidden' }} className="w-full">
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
         .lw-num { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; }
@@ -992,6 +1042,8 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                       key={dim}
                       draggable
                       onDragStart={() => setDragChip(dim)}
+                      onDoubleClick={(e) => { e.stopPropagation(); openSubsetEditor(dim); }}
+                      title="Double-click to choose which members show"
                       style={{
                         display: 'flex', alignItems: 'center', gap: 3, background: COLORS.jadeSoft, color: COLORS.jade,
                         borderRadius: 999, padding: '5px 8px 5px 10px', fontSize: 12.5, fontWeight: 600, cursor: 'grab', userSelect: 'none',
@@ -999,6 +1051,11 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                     >
                       <GripVertical size={11} />
                       <span>{PIVOT_DIMENSIONS[dim].label}</span>
+                      {pivotSubsets[dim] && (
+                        <span style={{ fontSize: 10, fontWeight: 700, background: COLORS.jade, color: '#fff', borderRadius: 999, padding: '1px 5px' }}>
+                          {pivotSubsets[dim].size}/{subsetAllMembers(dim).length}
+                        </span>
+                      )}
                       {zone === 'filter' && renderFilterValuePicker(dim)}
                       {isAxis && order.length > 1 && (
                         <span className="flex items-center" style={{ marginLeft: 2 }}>
@@ -1270,11 +1327,11 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
           // purposes while remembering it had them, so the header keeps a
           // clickable chevron and the cell shows a real rolled-up value
           // (via rollupPathFor) instead of going blank.
-          const rawColTree = buildPivotTree(colsOrder, granularity, {});
+          const rawColTree = buildPivotTree(colsOrder, granularity, {}, pivotSubsets);
           const colTree = pruneCollapsedPivotTree(rawColTree, pivotCollapsed);
           const colHeaderLevels = pivotColumnHeaderRows(colTree);
           const colLeaves = flattenPivotLeaves(colTree);
-          const rowTree = buildPivotTree(rowsOrder, granularity, {});
+          const rowTree = buildPivotTree(rowsOrder, granularity, {}, pivotSubsets);
 
           function cellValue(rowPath, rowHadChildren, colPath, colHadChildren) {
             const effRow = rowHadChildren ? rollupPathFor(rowPath, rowsOrder) : rowPath;
@@ -1371,10 +1428,69 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
           );
         })()}
       </div>
+
+      {/* ---------------- Subset editor modal ---------------- */}
+      {subsetEditorDim && (() => {
+        const members = subsetAllMembers(subsetEditorDim);
+        const allSelected = members.every((m) => subsetEditorDraft.has(m.id));
+        return (
+          <div
+            style={{ position: 'fixed', inset: 0, background: 'rgba(15,20,30,0.55)', zIndex: 50, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+            onClick={closeSubsetEditor}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              style={{ background: COLORS.surface, borderRadius: 12, width: 340, maxHeight: '70vh', display: 'flex', flexDirection: 'column', boxShadow: '0 12px 40px rgba(0,0,0,0.3)' }}
+            >
+              <div style={{ padding: '14px 18px', borderBottom: `1px solid ${COLORS.border}` }} className="flex items-center justify-between">
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700 }}>{PIVOT_DIMENSIONS[subsetEditorDim].label} subset</div>
+                  <div style={{ fontSize: 11.5, color: COLORS.textMuted }}>Choose which members to show</div>
+                </div>
+                <button onClick={closeSubsetEditor} style={{ background: 'none', border: 'none', color: COLORS.textMuted, cursor: 'pointer', display: 'flex', padding: 4 }}>
+                  <X size={16} />
+                </button>
+              </div>
+              <div style={{ padding: '8px 18px', display: 'flex', gap: 12, borderBottom: `1px solid ${COLORS.border}` }}>
+                <button onClick={() => setSubsetEditorDraft(new Set(members.map((m) => m.id)))} style={{ background: 'none', border: 'none', color: COLORS.violet, fontSize: 12, fontWeight: 600, cursor: 'pointer', padding: 0 }}>
+                  Select all
+                </button>
+                <button onClick={() => setSubsetEditorDraft(new Set())} style={{ background: 'none', border: 'none', color: COLORS.violet, fontSize: 12, fontWeight: 600, cursor: 'pointer', padding: 0 }}>
+                  Select none
+                </button>
+              </div>
+              <div style={{ overflowY: 'auto', padding: '8px 10px', flex: 1 }}>
+                {members.map((m) => (
+                  <label key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 8px', borderRadius: 6, cursor: 'pointer', fontSize: 13 }}>
+                    <input type="checkbox" checked={subsetEditorDraft.has(m.id)} onChange={() => toggleSubsetDraftMember(m.id)} />
+                    {m.name}
+                  </label>
+                ))}
+              </div>
+              <div style={{ padding: '12px 18px', borderTop: `1px solid ${COLORS.border}`, display: 'flex', gap: 8 }}>
+                <button
+                  onClick={closeSubsetEditor}
+                  style={{ flex: 1, background: 'none', border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 8, fontSize: 13, fontWeight: 600, cursor: 'pointer' }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={applySubsetEditor}
+                  disabled={subsetEditorDraft.size === 0}
+                  style={{
+                    flex: 1, background: subsetEditorDraft.size === 0 ? COLORS.border : COLORS.jade, color: '#fff', border: 'none', borderRadius: 8,
+                    padding: 8, fontSize: 13, fontWeight: 600, cursor: subsetEditorDraft.size === 0 ? 'default' : 'pointer',
+                  }}
+                >
+                  Apply{allSelected ? ' (all)' : ` (${subsetEditorDraft.size})`}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
       </>
       )}
-
-
 
 
       {/* ---------------- Hierarchy editor page ---------------- */}
@@ -1876,7 +1992,7 @@ function HierarchyEditor({ token }) {
     XLSX.writeFile(wb, `rosebud-${currentDim.toLowerCase()}-export.xlsx`);
   }
 
-  function renderRow(node, depth) {
+  function renderRow(node, depth, ancestorContinues, isLast) {
     const term = searchTerm.trim().toLowerCase();
     if (!hierMatchesFilter(node, term)) return null;
     const isCat = node.type === 'cat';
@@ -1892,17 +2008,40 @@ function HierarchyEditor({ token }) {
           onDragLeave={() => setDragOverId((cur) => (cur === node.id ? null : cur))}
           onDrop={(e) => { e.preventDefault(); handleDrop(node); }}
           onClick={() => selectNode(node.id)}
-          style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px', borderRadius: 6, cursor: 'pointer', marginLeft: depth * 22 }}
+          style={{ display: 'flex', alignItems: 'center', gap: 0, padding: '4px 8px', borderRadius: 6, cursor: 'pointer' }}
         >
-          {node.children ? (
-            <span onClick={(e) => { e.stopPropagation(); toggleExpand(node.id); }} style={{ display: 'flex', color: COLORS.textMuted, cursor: 'pointer' }}>
-              {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          {ancestorContinues.map((cont, i) => (
+            <span key={i} style={{ width: 16, textAlign: 'center', color: COLORS.border, flexShrink: 0, fontFamily: 'monospace', fontSize: 13, userSelect: 'none' }}>
+              {cont ? '│' : ''}
             </span>
-          ) : <span style={{ width: 14, flexShrink: 0 }} />}
-          <span style={{ width: 3, alignSelf: 'stretch', borderRadius: 2, flexShrink: 0, background: isCat ? COLORS.jade : COLORS.border }} />
-          {!isCat && <GripVertical size={12} className="hier-drag-handle" style={{ color: COLORS.textMuted, flexShrink: 0 }} />}
+          ))}
+          {depth > 0 && (
+            <span style={{ width: 16, textAlign: 'center', color: COLORS.border, flexShrink: 0, fontFamily: 'monospace', fontSize: 13, userSelect: 'none' }}>
+              {isLast ? '└' : '├'}
+            </span>
+          )}
+          {node.children ? (
+            <span
+              onClick={(e) => { e.stopPropagation(); toggleExpand(node.id); }}
+              style={{
+                width: 14, height: 14, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                border: `1px solid ${COLORS.border}`, borderRadius: 2, background: COLORS.surface, color: COLORS.textMuted,
+                fontSize: 10, fontWeight: 700, lineHeight: 1, cursor: 'pointer', marginRight: 6,
+              }}
+            >
+              {isOpen ? '−' : '+'}
+            </span>
+          ) : (
+            <span style={{ width: 14, flexShrink: 0, marginRight: 6 }} />
+          )}
+          {isCat ? (
+            <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.jade, marginRight: 5, flexShrink: 0, fontFamily: "'IBM Plex Mono', monospace" }} title="Consolidated (rollup)">Σ</span>
+          ) : (
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: COLORS.violet, marginRight: 5, flexShrink: 0 }} title="Leaf item" />
+          )}
+          {!isCat && <GripVertical size={11} className="hier-drag-handle" style={{ color: COLORS.textMuted, flexShrink: 0, marginRight: 3 }} />}
           <span style={{ fontSize: 13, fontWeight: isCat ? 700 : 400, letterSpacing: isCat ? '.01em' : 0 }}>{node.name}</span>
-          <span className="hier-actions" style={{ display: 'flex', gap: 2, marginLeft: 2 }}>
+          <span className="hier-actions" style={{ display: 'flex', gap: 2, marginLeft: 6 }}>
             {isCat && (
               <button onClick={(e) => { e.stopPropagation(); addLeafTo(node); }} title="Add item" style={{ background: 'none', border: 'none', color: COLORS.textMuted, cursor: 'pointer', display: 'flex', padding: 3, borderRadius: 4 }}>
                 <Plus size={13} />
@@ -1913,7 +2052,7 @@ function HierarchyEditor({ token }) {
             </button>
           </span>
         </div>
-        {node.children && isOpen && node.children.map((c) => renderRow(c, depth + 1))}
+        {node.children && isOpen && node.children.map((c, i) => renderRow(c, depth + 1, [...ancestorContinues, depth > 0 ? !isLast : false], i === node.children.length - 1))}
       </div>
     );
   }
@@ -1956,7 +2095,7 @@ function HierarchyEditor({ token }) {
               <Download size={13} /> Export to Excel
             </button>
           </div>
-          {renderRow(tree, 0)}
+          {renderRow(tree, 0, [], true)}
         </div>
 
         <div style={{ width: 300, padding: '16px 20px', background: COLORS.surfaceAlt }}>
