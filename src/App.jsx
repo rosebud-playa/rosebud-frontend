@@ -1248,11 +1248,11 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
               return (
                 <React.Fragment key={key}>
                   <tr style={{ borderTop: `1px solid ${COLORS.border}`, background: COLORS.surfaceAlt, cursor: 'pointer' }} onClick={() => togglePivotExpand(node.path)}>
-                    <td style={{ position: 'sticky', left: 0, background: COLORS.surfaceAlt, zIndex: 1 }} className="px-3 py-1.5 whitespace-nowrap text-sm font-semibold">
-                      <span style={{ paddingLeft: depth * 18, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    <td style={{ position: 'sticky', left: 0, background: COLORS.surfaceAlt, zIndex: 1, textAlign: 'left' }} className="px-3 py-1.5 whitespace-nowrap text-sm font-semibold">
+                      <div style={{ paddingLeft: depth * 18, display: 'flex', alignItems: 'center', gap: 6 }}>
                         {isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
                         {node.name}
-                      </span>
+                      </div>
                     </td>
                     <td colSpan={colLeaves.length} style={{ background: COLORS.surfaceAlt }} />
                   </tr>
@@ -1262,8 +1262,8 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             }
             return (
               <tr key={key} className="lw-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
-                <td style={{ position: 'sticky', left: 0, background: node.isTotal ? '#1C2333' : COLORS.surface, color: node.isTotal ? '#fff' : undefined, zIndex: 1 }} className="px-3 py-1.5 whitespace-nowrap text-sm">
-                  <span style={{ paddingLeft: depth * 18, fontWeight: node.isTotal ? 700 : 400 }}>{node.name}</span>
+                <td style={{ position: 'sticky', left: 0, background: node.isTotal ? '#1C2333' : COLORS.surface, color: node.isTotal ? '#fff' : undefined, zIndex: 1, textAlign: 'left' }} className="px-3 py-1.5 whitespace-nowrap text-sm">
+                  <div style={{ paddingLeft: depth * 18, fontWeight: node.isTotal ? 700 : 400 }}>{node.name}</div>
                 </td>
                 {colLeaves.map((c) => (
                   <td key={JSON.stringify(c.path)} className="px-3 py-1.5 text-right" style={{ background: node.isTotal ? COLORS.violet : (c.isTotal ? COLORS.surfaceAlt : undefined), color: node.isTotal ? '#fff' : undefined }}>
