@@ -1068,7 +1068,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       </div>
 
       {/* ---------------- Grid ---------------- */}
-      <div className="px-6 pt-4 pb-2">
+      <div className="px-6 pt-4 pb-2" style={{ width: '100%', maxWidth: '100%', boxSizing: 'border-box' }}>
         {isDefaultConfig && !compareMode && (!canEdit || currentProduct === 'all') && (
           <div style={{ color: COLORS.textMuted }} className="text-xs mb-2">
             {currentEntity === 'company' && 'Select a specific entity to edit inputs. '}
@@ -1077,9 +1077,9 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
           </div>
         )}
         {isDefaultConfig && (
-        <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
-          <div className="overflow-x-auto">
-            <table style={{ minWidth: compareMode ? 640 : columns.length * 92 + 220, borderCollapse: 'collapse' }} className="w-full text-sm">
+        <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, width: '100%', maxWidth: '100%' }} className="rounded-lg overflow-hidden">
+          <div className="overflow-x-auto" style={{ width: '100%' }}>
+            <table style={{ minWidth: compareMode ? 640 : columns.length * 92 + 220, width: '100%', borderCollapse: 'collapse' }} className="text-sm">
               <thead>
                 {!compareMode ? (
                   <tr style={{ background: COLORS.bgChrome }}>
@@ -1943,6 +1943,7 @@ function HierarchyEditor({ token }) {
               <option>Products</option>
               <option>Accounts</option>
               <option>Entities</option>
+              <option>Time</option>
             </select>
             <div style={{ position: 'relative', flex: 1, minWidth: 0 }}>
               <Search size={14} style={{ position: 'absolute', left: 10, top: 9, color: COLORS.textMuted }} />
