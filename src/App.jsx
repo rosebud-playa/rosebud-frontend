@@ -182,6 +182,16 @@ function pivotColumnHeaderRows(tree) {
   })(tree, 0);
   return rows;
 }
+// Display name for a given (dimension, member id) pair, independent of any
+// tree position — used in Tabular Form where every nested level gets its own
+// column, so a leaf row needs each ancestor's name individually, not just
+// the innermost one a tree node would carry.
+function pivotMemberName(dim, id, granularity) {
+  const meta = PIVOT_DIMENSIONS[dim];
+  if (meta?.hasTotal && id === meta.totalId) return meta.totalName;
+  const found = pivotMembers(dim, granularity).find((m) => m.id === id);
+  return found ? found.name : id;
+}
 
 /* ----------------------------------------------------------------------
    MODEL ENGINE  (pure functions — operate on a plain data object)
@@ -344,7 +354,6 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const [filterAccount, setFilterAccount] = useState('revenue');
   const [filterTime, setFilterTime] = useState('FY');
   const [dragChip, setDragChip] = useState(null);
-  const [pivotCollapsed, setPivotCollapsed] = useState(() => new Set());
   const [granularity, setGranularity] = useState('Monthly');
   const [expanded, setExpanded] = useState(() => new Set(['revenue', 'expenses']));
   const [compareMode, setCompareMode] = useState(false);
@@ -575,10 +584,6 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       [next[idx], next[swapWith]] = [next[swapWith], next[idx]];
       return next;
     });
-  }
-  function togglePivotExpand(path) {
-    const key = JSON.stringify(path);
-    setPivotCollapsed((prev) => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
   }
 
   // The small value-picker embedded in a chip when that dimension is sitting
@@ -1236,58 +1241,35 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             return ACCOUNTS_BY_ID[filterAccount]?.unit || '$';
           }
 
-          const rowTree = buildPivotTree(rowsOrder, granularity, {});
           const colTree = buildPivotTree(colsOrder, granularity, {});
           const colHeaderLevels = pivotColumnHeaderRows(colTree);
           const colLeaves = flattenPivotLeaves(colTree);
-
-          function renderPivotRowNode(node, depth) {
-            const key = JSON.stringify(node.path);
-            const isExpanded = !pivotCollapsed.has(key);
-            if (node.children) {
-              return (
-                <React.Fragment key={key}>
-                  <tr style={{ borderTop: `1px solid ${COLORS.border}`, background: COLORS.surfaceAlt, cursor: 'pointer' }} onClick={() => togglePivotExpand(node.path)}>
-                    <td style={{ position: 'sticky', left: 0, background: COLORS.surfaceAlt, zIndex: 1, textAlign: 'left' }} className="px-3 py-1.5 whitespace-nowrap text-sm font-semibold">
-                      <div style={{ paddingLeft: depth * 18, display: 'flex', alignItems: 'center', gap: 6 }}>
-                        {isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                        {node.name}
-                      </div>
-                    </td>
-                    <td colSpan={colLeaves.length} style={{ background: COLORS.surfaceAlt }} />
-                  </tr>
-                  {isExpanded && node.children.map((child) => renderPivotRowNode(child, depth + 1))}
-                </React.Fragment>
-              );
-            }
-            return (
-              <tr key={key} className="lw-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
-                <td style={{ position: 'sticky', left: 0, background: node.isTotal ? '#1C2333' : COLORS.surface, color: node.isTotal ? '#fff' : undefined, zIndex: 1, textAlign: 'left' }} className="px-3 py-1.5 whitespace-nowrap text-sm">
-                  <div style={{ paddingLeft: depth * 18, fontWeight: node.isTotal ? 700 : 400 }}>{node.name}</div>
-                </td>
-                {colLeaves.map((c) => (
-                  <td key={JSON.stringify(c.path)} className="px-3 py-1.5 text-right" style={{ background: node.isTotal ? COLORS.violet : (c.isTotal ? COLORS.surfaceAlt : undefined), color: node.isTotal ? '#fff' : undefined }}>
-                    <span className="lw-num" style={{ fontSize: 12.5, fontWeight: (node.isTotal || c.isTotal) ? 600 : 400 }}>{fmtCell(unitFor(node.path, c.path), valueAt(node.path, c.path))}</span>
-                  </td>
-                ))}
-              </tr>
-            );
-          }
+          // Tabular Form: every nested row dimension gets its own column,
+          // side by side — not stacked as a collapsible tree. Each leaf
+          // combination (e.g. Account=Revenue, Product=Core Widget) is one
+          // full row with a value in every one of those columns.
+          const rowLeaves = flattenPivotLeaves(buildPivotTree(rowsOrder, granularity, {}));
+          const bodyFont = { fontFamily: "'IBM Plex Sans', sans-serif" };
 
           return (
             <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
               <div className="overflow-x-auto">
-                <table style={{ minWidth: colLeaves.length * 100 + 220, borderCollapse: 'collapse' }} className="w-full text-sm">
+                <table style={{ minWidth: colLeaves.length * 100 + rowsOrder.length * 140, borderCollapse: 'collapse', ...bodyFont }} className="w-full text-sm">
                   <thead>
                     {colHeaderLevels.map((levelCells, levelIdx) => (
                       <tr key={levelIdx} style={{ background: COLORS.bgChrome }}>
-                        {levelIdx === 0 && (
-                          <th rowSpan={colHeaderLevels.length} style={{ position: 'sticky', left: 0, background: COLORS.bgChrome, color: COLORS.textOnDark, zIndex: 2 }} className="text-left px-3 py-2 text-xs font-medium whitespace-nowrap">
-                            {rowsOrder.map((d) => PIVOT_DIMENSIONS[d].label).join(' › ')}
+                        {levelIdx === 0 && rowsOrder.map((dim, i) => (
+                          <th
+                            key={dim}
+                            rowSpan={colHeaderLevels.length}
+                            style={{ position: i === 0 ? 'sticky' : undefined, left: i === 0 ? 0 : undefined, background: COLORS.bgChrome, color: COLORS.textOnDark, zIndex: i === 0 ? 3 : 2, ...bodyFont }}
+                            className="text-left px-3 py-2 text-xs font-medium whitespace-nowrap"
+                          >
+                            {PIVOT_DIMENSIONS[dim].label}
                           </th>
-                        )}
+                        ))}
                         {levelCells.map((cell, i) => (
-                          <th key={i} colSpan={cell.colSpan} style={{ color: cell.isTotal ? '#fff' : COLORS.textOnDarkMuted, background: cell.isTotal ? '#232B3D' : 'transparent' }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">
+                          <th key={i} colSpan={cell.colSpan} style={{ color: cell.isTotal ? '#fff' : COLORS.textOnDarkMuted, background: cell.isTotal ? '#232B3D' : 'transparent', ...bodyFont }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">
                             {cell.name}
                           </th>
                         ))}
@@ -1295,7 +1277,31 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                     ))}
                   </thead>
                   <tbody>
-                    {rowTree.map((node) => renderPivotRowNode(node, 0))}
+                    {rowLeaves.map((leaf) => {
+                      const key = JSON.stringify(leaf.path);
+                      return (
+                        <tr key={key} className="lw-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
+                          {rowsOrder.map((dim, i) => (
+                            <td
+                              key={dim}
+                              style={{
+                                position: i === 0 ? 'sticky' : undefined, left: i === 0 ? 0 : undefined,
+                                background: leaf.isTotal ? '#1C2333' : COLORS.surface, color: leaf.isTotal ? '#fff' : undefined,
+                                zIndex: i === 0 ? 1 : undefined, textAlign: 'left', ...bodyFont,
+                              }}
+                              className="px-3 py-1.5 whitespace-nowrap text-sm"
+                            >
+                              {pivotMemberName(dim, leaf.path[dim], granularity)}
+                            </td>
+                          ))}
+                          {colLeaves.map((c) => (
+                            <td key={JSON.stringify(c.path)} className="px-3 py-1.5 text-right" style={{ background: leaf.isTotal ? COLORS.violet : (c.isTotal ? COLORS.surfaceAlt : undefined), color: leaf.isTotal ? '#fff' : undefined }}>
+                              <span className="lw-num" style={{ fontSize: 12.5, fontWeight: (leaf.isTotal || c.isTotal) ? 600 : 400 }}>{fmtCell(unitFor(leaf.path, c.path), valueAt(leaf.path, c.path))}</span>
+                            </td>
+                          ))}
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1308,6 +1314,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       </div>
       </>
       )}
+
 
       {/* ---------------- Hierarchy editor page ---------------- */}
       {showHierarchy && (
