@@ -888,6 +888,16 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
               </select>
             )}
             <button
+              onClick={() => navigate('/')}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6, padding: '5px 10px', borderRadius: 6, fontSize: 12.5,
+                background: location.pathname === '/' ? COLORS.violet : 'none', color: location.pathname === '/' ? '#fff' : COLORS.textOnDarkMuted,
+                border: `1px solid ${location.pathname === '/' ? COLORS.violet : COLORS.chromeBorder}`, cursor: 'pointer',
+              }}
+            >
+              Workspace
+            </button>
+            <button
               onClick={() => { if (showMembers) navigate('/'); else { navigate('/members'); loadMembers(); } }}
               style={{
                 display: 'flex', alignItems: 'center', gap: 6, padding: '5px 10px', borderRadius: 6, fontSize: 12.5,
@@ -1134,9 +1144,8 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
           </div>
         )}
         {isDefaultConfig && (
-        <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, width: '100%', maxWidth: '100%' }} className="rounded-lg overflow-hidden">
-          <div className="overflow-x-auto" style={{ width: '100%' }}>
-            <table style={{ minWidth: compareMode ? 640 : columns.length * 92 + 220, width: '100%', borderCollapse: 'collapse' }} className="text-sm">
+        <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 8, overflowX: 'auto', width: '100%', maxWidth: '100%' }}>
+            <table style={{ minWidth: compareMode ? 640 : columns.length * 92 + 220, borderCollapse: 'collapse' }} className="text-sm">
               <thead>
                 {!compareMode ? (
                   <tr style={{ background: COLORS.bgChrome }}>
@@ -1283,7 +1292,6 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                 })()}
               </tbody>
             </table>
-          </div>
         </div>
         )}
         {isDefaultConfig && (
@@ -1384,9 +1392,9 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
           }
 
           return (
-            <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, width: '100%', maxWidth: '100%' }} className="rounded-lg overflow-hidden">
-              <div className="overflow-x-auto" style={{ width: '100%' }}>
-                <table style={{ minWidth: colLeaves.length * 100 + 220, width: '100%', borderCollapse: 'collapse', ...bodyFont }} className="text-sm">
+            <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 8, width: '100%', maxWidth: '100%', overflow: 'hidden' }}>
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ minWidth: colLeaves.length * 100 + 220, borderCollapse: 'collapse', ...bodyFont }} className="text-sm">
                   <thead>
                     {colHeaderLevels.map((levelCells, levelIdx) => (
                       <tr key={levelIdx} style={{ background: COLORS.bgChrome }}>
