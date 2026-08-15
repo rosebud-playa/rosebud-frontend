@@ -354,6 +354,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const [filterAccount, setFilterAccount] = useState('revenue');
   const [filterTime, setFilterTime] = useState('FY');
   const [dragChip, setDragChip] = useState(null);
+  const [pivotCollapsed, setPivotCollapsed] = useState(() => new Set());
   const [granularity, setGranularity] = useState('Monthly');
   const [expanded, setExpanded] = useState(() => new Set(['revenue', 'expenses']));
   const [compareMode, setCompareMode] = useState(false);
@@ -584,6 +585,10 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       [next[idx], next[swapWith]] = [next[swapWith], next[idx]];
       return next;
     });
+  }
+  function togglePivotExpand(path) {
+    const key = JSON.stringify(path);
+    setPivotCollapsed((prev) => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
   }
 
   // The small value-picker embedded in a chip when that dimension is sitting
@@ -1240,34 +1245,87 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             if ('account' in combined) return ACCOUNTS_BY_ID[combined.account]?.unit || '$';
             return ACCOUNTS_BY_ID[filterAccount]?.unit || '$';
           }
+          // A group-header row (e.g. "Revenue" before drilling into Product)
+          // still shows a real rolled-up number, matching TM1 — not a blank
+          // row. Any row-axis dimension not yet reached by this node's path
+          // gets filled with its "all members" total id. If a not-yet-reached
+          // dimension has no such total (Account, Scenario — summing those
+          // flatly would double-count or make no sense), the roll-up is
+          // honestly shown as "—" rather than a misleading number.
+          function rollupPathFor(node) {
+            const filled = { ...node.path };
+            for (const dim of rowsOrder) {
+              if (!(dim in filled)) {
+                const meta = PIVOT_DIMENSIONS[dim];
+                if (meta?.hasTotal) filled[dim] = meta.totalId;
+                else return null;
+              }
+            }
+            return filled;
+          }
+          const bodyFont = { fontFamily: "'IBM Plex Sans', sans-serif" };
 
           const colTree = buildPivotTree(colsOrder, granularity, {});
           const colHeaderLevels = pivotColumnHeaderRows(colTree);
           const colLeaves = flattenPivotLeaves(colTree);
-          // Tabular Form: every nested row dimension gets its own column,
-          // side by side — not stacked as a collapsible tree. Each leaf
-          // combination (e.g. Account=Revenue, Product=Core Widget) is one
-          // full row with a value in every one of those columns.
-          const rowLeaves = flattenPivotLeaves(buildPivotTree(rowsOrder, granularity, {}));
-          const bodyFont = { fontFamily: "'IBM Plex Sans', sans-serif" };
+          const rowTree = buildPivotTree(rowsOrder, granularity, {});
+
+          function renderPivotRowNode(node, depth) {
+            const key = JSON.stringify(node.path);
+            const isExpanded = !pivotCollapsed.has(key);
+            const rowPath = node.children ? rollupPathFor(node) : node.path;
+            const isTotalStyle = node.isTotal;
+            return (
+              <React.Fragment key={key}>
+                <tr
+                  className={node.children ? undefined : 'lw-row'}
+                  style={{ borderTop: `1px solid ${COLORS.border}`, background: node.children ? COLORS.surfaceAlt : undefined, cursor: node.children ? 'pointer' : undefined }}
+                  onClick={node.children ? () => togglePivotExpand(node.path) : undefined}
+                >
+                  <td
+                    style={{
+                      position: 'sticky', left: 0, zIndex: 1, textAlign: 'left', ...bodyFont,
+                      background: isTotalStyle ? '#1C2333' : (node.children ? COLORS.surfaceAlt : COLORS.surface),
+                      color: isTotalStyle ? '#fff' : undefined,
+                    }}
+                    className="px-3 py-1.5 whitespace-nowrap text-sm"
+                  >
+                    <div style={{ paddingLeft: depth * 18, display: 'flex', alignItems: 'center', gap: 6, fontWeight: node.children ? 700 : (isTotalStyle ? 700 : 400) }}>
+                      {node.children ? (isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />) : <span style={{ width: 13 }} />}
+                      {node.name}
+                    </div>
+                  </td>
+                  {colLeaves.map((c) => (
+                    <td key={JSON.stringify(c.path)} className="px-3 py-1.5 text-right" style={{ background: isTotalStyle ? COLORS.violet : (node.children ? COLORS.surfaceAlt : (c.isTotal ? COLORS.surfaceAlt : undefined)), color: isTotalStyle ? '#fff' : undefined }}>
+                      {rowPath ? (
+                        <span className="lw-num" style={{ fontSize: 12.5, fontWeight: (isTotalStyle || c.isTotal || node.children) ? 600 : 400 }}>{fmtCell(unitFor(rowPath, c.path), valueAt(rowPath, c.path))}</span>
+                      ) : (
+                        <span style={{ color: COLORS.textMuted, fontSize: 12.5 }}>—</span>
+                      )}
+                    </td>
+                  ))}
+                </tr>
+                {node.children && isExpanded && node.children.map((child) => renderPivotRowNode(child, depth + 1))}
+              </React.Fragment>
+            );
+          }
 
           return (
-            <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
-              <div className="overflow-x-auto">
-                <table style={{ minWidth: colLeaves.length * 100 + rowsOrder.length * 140, borderCollapse: 'collapse', ...bodyFont }} className="w-full text-sm">
+            <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, width: '100%', maxWidth: '100%' }} className="rounded-lg overflow-hidden">
+              <div className="overflow-x-auto" style={{ width: '100%' }}>
+                <table style={{ minWidth: colLeaves.length * 100 + 220, width: '100%', borderCollapse: 'collapse', ...bodyFont }} className="text-sm">
                   <thead>
                     {colHeaderLevels.map((levelCells, levelIdx) => (
                       <tr key={levelIdx} style={{ background: COLORS.bgChrome }}>
-                        {levelIdx === 0 && rowsOrder.map((dim, i) => (
+                        {levelIdx === 0 && (
                           <th
-                            key={dim}
                             rowSpan={colHeaderLevels.length}
-                            style={{ position: i === 0 ? 'sticky' : undefined, left: i === 0 ? 0 : undefined, background: COLORS.bgChrome, color: COLORS.textOnDark, zIndex: i === 0 ? 3 : 2, ...bodyFont }}
+                            style={{ position: 'sticky', left: 0, background: COLORS.bgChrome, color: COLORS.textOnDark, zIndex: 3, ...bodyFont }}
                             className="text-left px-3 py-2 text-xs font-medium whitespace-nowrap"
                           >
-                            {PIVOT_DIMENSIONS[dim].label}
+                            {rowsOrder.map((d) => PIVOT_DIMENSIONS[d].label).join(' › ')}
                           </th>
-                        ))}
+                        )}
                         {levelCells.map((cell, i) => (
                           <th key={i} colSpan={cell.colSpan} style={{ color: cell.isTotal ? '#fff' : COLORS.textOnDarkMuted, background: cell.isTotal ? '#232B3D' : 'transparent', ...bodyFont }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">
                             {cell.name}
@@ -1277,31 +1335,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
                     ))}
                   </thead>
                   <tbody>
-                    {rowLeaves.map((leaf) => {
-                      const key = JSON.stringify(leaf.path);
-                      return (
-                        <tr key={key} className="lw-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
-                          {rowsOrder.map((dim, i) => (
-                            <td
-                              key={dim}
-                              style={{
-                                position: i === 0 ? 'sticky' : undefined, left: i === 0 ? 0 : undefined,
-                                background: leaf.isTotal ? '#1C2333' : COLORS.surface, color: leaf.isTotal ? '#fff' : undefined,
-                                zIndex: i === 0 ? 1 : undefined, textAlign: 'left', ...bodyFont,
-                              }}
-                              className="px-3 py-1.5 whitespace-nowrap text-sm"
-                            >
-                              {pivotMemberName(dim, leaf.path[dim], granularity)}
-                            </td>
-                          ))}
-                          {colLeaves.map((c) => (
-                            <td key={JSON.stringify(c.path)} className="px-3 py-1.5 text-right" style={{ background: leaf.isTotal ? COLORS.violet : (c.isTotal ? COLORS.surfaceAlt : undefined), color: leaf.isTotal ? '#fff' : undefined }}>
-                              <span className="lw-num" style={{ fontSize: 12.5, fontWeight: (leaf.isTotal || c.isTotal) ? 600 : 400 }}>{fmtCell(unitFor(leaf.path, c.path), valueAt(leaf.path, c.path))}</span>
-                            </td>
-                          ))}
-                        </tr>
-                      );
-                    })}
+                    {rowTree.map((node) => renderPivotRowNode(node, 0))}
                   </tbody>
                 </table>
               </div>
@@ -1314,6 +1348,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       </div>
       </>
       )}
+
 
 
       {/* ---------------- Hierarchy editor page ---------------- */}
