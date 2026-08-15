@@ -100,6 +100,7 @@ const PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS = ACCOUNTS.filter((a) => a.id === 'prod
 // have no "Total" member: summing the flat account list would double-count
 // rollups against their own children, and summing across scenarios has no
 // sensible meaning.
+const ALL_PIVOT_DIMS = ['account', 'entity', 'product', 'scenario', 'time'];
 const PIVOT_DIMENSIONS = {
   account: { label: 'Account' },
   entity: { label: 'Entity', hasTotal: true, totalId: 'company', totalName: 'Company (Total)' },
@@ -130,6 +131,56 @@ function pivotMembers(dim, granularity) {
 function getPivotCellValue(allScenarioValues, scenario, entityId, accountId, period, productId) {
   const data = allScenarioValues[scenario] || {};
   return getPeriodValue(data, entityId, accountId, period, productId);
+}
+
+// Builds a tree for an ordered list of nested dimensions (e.g. ['account',
+// 'entity'] = Account outer, Entity inner). Each node carries `path` — the
+// full {dim: id} map from the root down to that node — which is exactly what
+// a cell needs to resolve its value. Any dimension in `dims` beyond the
+// first becomes nested children of every member (and Total, where that
+// dimension has one) at the level above.
+function buildPivotTree(dims, granularity, pathSoFar) {
+  if (dims.length === 0) return null;
+  const [dim, ...rest] = dims;
+  const meta = PIVOT_DIMENSIONS[dim];
+  const members = pivotMembers(dim, granularity).map((m) => ({ id: m.id, name: m.name, isTotal: false }));
+  if (meta?.hasTotal) members.push({ id: meta.totalId, name: meta.totalName, isTotal: true });
+  return members.map((m) => {
+    const path = { ...pathSoFar, [dim]: m.id };
+    return { dim, id: m.id, name: m.name, isTotal: m.isTotal, path, children: rest.length ? buildPivotTree(rest, granularity, path) : null };
+  });
+}
+// Number of leaf columns/rows a node ultimately expands into — used as the
+// colspan for column headers, and (implicitly, one row per leaf) for rows.
+function countPivotLeaves(node) {
+  if (!node.children || node.children.length === 0) return 1;
+  return node.children.reduce((s, c) => s + countPivotLeaves(c), 0);
+}
+// Flattens a tree down to just its leaf nodes, each still carrying its full
+// path — this is the actual list of columns (or, for rows, the base list
+// before indentation/grouping is applied for display).
+function flattenPivotLeaves(nodes) {
+  const leaves = [];
+  (nodes || []).forEach((node) => {
+    if (node.children && node.children.length) leaves.push(...flattenPivotLeaves(node.children));
+    else leaves.push(node);
+  });
+  return leaves;
+}
+// One header row per nesting level, each cell's colSpan equal to how many
+// leaf columns it ultimately covers — the standard multi-level column
+// header pattern, generalized to any depth.
+function pivotColumnHeaderRows(tree) {
+  const rows = [];
+  (function walk(nodes, level) {
+    if (!nodes || nodes.length === 0) return;
+    rows[level] = rows[level] || [];
+    nodes.forEach((node) => {
+      rows[level].push({ name: node.name, isTotal: node.isTotal, colSpan: countPivotLeaves(node) });
+      if (node.children) walk(node.children, level + 1);
+    });
+  })(tree, 0);
+  return rows;
 }
 
 /* ----------------------------------------------------------------------
@@ -283,15 +334,17 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const [currentScenario, setCurrentScenario] = useState('Budget');
   const [currentEntity, setCurrentEntity] = useState('company');
   const [currentProduct, setCurrentProduct] = useState('all');
-  // Which of the 5 dimensions is on rows/columns/filter right now, plus the
-  // two genuinely new filter values (Entity and Product already have their
-  // own long-standing state above; Scenario's filter value is currentScenario
-  // itself, used elsewhere by Versions/Backups — none of those three are
-  // duplicated here).
-  const [axisAssignment, setAxisAssignment] = useState({ account: 'rows', entity: 'filter', product: 'filter', scenario: 'filter', time: 'cols' });
+  // Ordered lists (outer to inner nesting) of which dimensions sit on each
+  // axis. Whatever isn't in either list is a Filter. Scenario's filter value
+  // is currentScenario itself (used elsewhere by Versions/Backups), and
+  // Entity/Product reuse their existing long-standing state — only Account
+  // and Time need new filter-value state below.
+  const [rowsOrder, setRowsOrder] = useState(['account']);
+  const [colsOrder, setColsOrder] = useState(['time']);
   const [filterAccount, setFilterAccount] = useState('revenue');
   const [filterTime, setFilterTime] = useState('FY');
   const [dragChip, setDragChip] = useState(null);
+  const [pivotCollapsed, setPivotCollapsed] = useState(() => new Set());
   const [granularity, setGranularity] = useState('Monthly');
   const [expanded, setExpanded] = useState(() => new Set(['revenue', 'expenses']));
   const [compareMode, setCompareMode] = useState(false);
@@ -476,7 +529,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   }
 
   const liveData = values[currentScenario];
-  const isDefaultConfig = axisAssignment.account === 'rows' && axisAssignment.time === 'cols';
+  const isDefaultConfig = rowsOrder.length === 1 && rowsOrder[0] === 'account' && colsOrder.length === 1 && colsOrder[0] === 'time';
 
   const columns = useMemo(() => {
     if (granularity === 'Monthly') return [...MONTHS, 'FY'];
@@ -495,25 +548,37 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
     return rows;
   }, [expanded]);
 
-  // Dragging a dimension chip into Rows or Columns (each holds exactly one)
-  // swaps it with whatever's currently there — the displaced dimension takes
-  // the dragged one's old zone. Filter (holds the remaining 3) never evicts.
-  function assignToZone(dim, targetZone) {
-    setAxisAssignment((prev) => {
-      if (prev[dim] === targetZone) return prev;
-      const next = { ...prev };
-      const sourceZone = prev[dim];
-      if (targetZone === 'rows' || targetZone === 'cols') {
-        const occupant = Object.keys(prev).find((k) => prev[k] === targetZone);
-        if (occupant) next[occupant] = sourceZone;
-      }
-      next[dim] = targetZone;
-      return next;
+  // Moves a dimension to Rows, Columns, or Filter — it's removed from
+  // wherever it was and appended as the innermost level of its new axis (if
+  // moved to Rows/Columns), supporting any number of nested dimensions.
+  function moveDimToZone(dim, targetZone) {
+    setRowsOrder((prev) => {
+      const without = prev.filter((d) => d !== dim);
+      return targetZone === 'rows' ? [...without, dim] : without;
+    });
+    setColsOrder((prev) => {
+      const without = prev.filter((d) => d !== dim);
+      return targetZone === 'cols' ? [...without, dim] : without;
     });
     if (dim === 'product' && (targetZone === 'rows' || targetZone === 'cols') && !PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS.some((a) => a.id === filterAccount)) {
       setFilterAccount('product_revenue');
     }
-    if (targetZone === 'rows' || targetZone === 'cols') setCompareMode(false);
+    setCompareMode(false);
+  }
+  // Swaps a dimension earlier/later within its own axis's nesting order.
+  function reorderDim(dim, direction, order, setOrder) {
+    setOrder((prev) => {
+      const idx = prev.indexOf(dim);
+      const swapWith = idx + direction;
+      if (idx === -1 || swapWith < 0 || swapWith >= prev.length) return prev;
+      const next = [...prev];
+      [next[idx], next[swapWith]] = [next[swapWith], next[idx]];
+      return next;
+    });
+  }
+  function togglePivotExpand(path) {
+    const key = JSON.stringify(path);
+    setPivotCollapsed((prev) => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n; });
   }
 
   // The small value-picker embedded in a chip when that dimension is sitting
@@ -542,7 +607,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       );
     }
     if (dim === 'account') {
-      const options = axisAssignment.product !== 'filter' ? PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS : PIVOT_ACCOUNT_OPTIONS;
+      const options = (rowsOrder.includes('product') || colsOrder.includes('product')) ? PIVOT_ACCOUNT_OPTIONS_PRODUCT_ROWS : PIVOT_ACCOUNT_OPTIONS;
       return (
         <select value={filterAccount} onChange={(e) => setFilterAccount(e.target.value)} onMouseDown={stop} className="lw-select" style={style}>
           {options.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
@@ -875,42 +940,67 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
       {/* ---------------- Pivot configuration ---------------- */}
       <div className="px-6 pt-4">
         <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderRadius: 10, padding: 12 }} className="flex items-stretch gap-3 flex-wrap">
-          {['rows', 'cols', 'filter'].map((zone) => (
-            <div
-              key={zone}
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={() => { if (dragChip) assignToZone(dragChip, zone); setDragChip(null); }}
-              style={{
-                flex: zone === 'filter' ? 2 : 1, minWidth: zone === 'filter' ? 230 : 110,
-                border: `1.5px dashed ${COLORS.border}`, borderRadius: 8, padding: '8px 10px',
-                display: 'flex', flexDirection: 'column', gap: 6,
-              }}
-            >
-              <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: '.06em', color: COLORS.textMuted, textTransform: 'uppercase' }}>
-                {zone === 'rows' ? 'Rows' : zone === 'cols' ? 'Columns' : 'Filters'}
+          {['rows', 'cols', 'filter'].map((zone) => {
+            const order = zone === 'rows' ? rowsOrder : zone === 'cols' ? colsOrder : ALL_PIVOT_DIMS.filter((d) => !rowsOrder.includes(d) && !colsOrder.includes(d));
+            const setOrder = zone === 'rows' ? setRowsOrder : zone === 'cols' ? setColsOrder : null;
+            const isAxis = zone === 'rows' || zone === 'cols';
+            return (
+              <div
+                key={zone}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={() => { if (dragChip) moveDimToZone(dragChip, zone); setDragChip(null); }}
+                style={{
+                  flex: zone === 'filter' ? 2 : 1, minWidth: zone === 'filter' ? 230 : 140,
+                  border: `1.5px dashed ${COLORS.border}`, borderRadius: 8, padding: '8px 10px',
+                  display: 'flex', flexDirection: 'column', gap: 6,
+                }}
+              >
+                <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: '.06em', color: COLORS.textMuted, textTransform: 'uppercase' }}>
+                  {zone === 'rows' ? 'Rows (outer → inner)' : zone === 'cols' ? 'Columns (outer → inner)' : 'Filters'}
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {order.map((dim, i) => (
+                    <div
+                      key={dim}
+                      draggable
+                      onDragStart={() => setDragChip(dim)}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 3, background: COLORS.jadeSoft, color: COLORS.jade,
+                        borderRadius: 999, padding: '5px 8px 5px 10px', fontSize: 12.5, fontWeight: 600, cursor: 'grab', userSelect: 'none',
+                      }}
+                    >
+                      <GripVertical size={11} />
+                      <span>{PIVOT_DIMENSIONS[dim].label}</span>
+                      {zone === 'filter' && renderFilterValuePicker(dim)}
+                      {isAxis && order.length > 1 && (
+                        <span className="flex items-center" style={{ marginLeft: 2 }}>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); reorderDim(dim, -1, order, setOrder); }}
+                            disabled={i === 0}
+                            title="Nest earlier (more outer)"
+                            style={{ background: 'none', border: 'none', color: COLORS.jade, cursor: i === 0 ? 'default' : 'pointer', opacity: i === 0 ? 0.3 : 1, padding: '0 1px', fontSize: 11, lineHeight: 1 }}
+                          >
+                            ‹
+                          </button>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); reorderDim(dim, 1, order, setOrder); }}
+                            disabled={i === order.length - 1}
+                            title="Nest later (more inner)"
+                            style={{ background: 'none', border: 'none', color: COLORS.jade, cursor: i === order.length - 1 ? 'default' : 'pointer', opacity: i === order.length - 1 ? 0.3 : 1, padding: '0 1px', fontSize: 11, lineHeight: 1 }}
+                          >
+                            ›
+                          </button>
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
               </div>
-              <div className="flex items-center gap-2 flex-wrap">
-                {Object.keys(axisAssignment).filter((d) => axisAssignment[d] === zone).map((dim) => (
-                  <div
-                    key={dim}
-                    draggable
-                    onDragStart={() => setDragChip(dim)}
-                    style={{
-                      display: 'flex', alignItems: 'center', gap: 5, background: COLORS.jadeSoft, color: COLORS.jade,
-                      borderRadius: 999, padding: '5px 10px', fontSize: 12.5, fontWeight: 600, cursor: 'grab', userSelect: 'none',
-                    }}
-                  >
-                    <GripVertical size={11} />
-                    {PIVOT_DIMENSIONS[dim].label}
-                    {zone === 'filter' && renderFilterValuePicker(dim)}
-                  </div>
-                ))}
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
         <div style={{ color: COLORS.textMuted }} className="text-xs mt-1.5">
-          Drag a dimension between Rows, Columns, and Filters to reshape the grid below. Only the default Account × Time arrangement supports full editing and hierarchy drill-down — other arrangements are read-only.
+          Drag dimensions between Rows, Columns, and Filters — drop more than one onto the same axis to nest them, and use ‹ › to reorder. Only the default Account × Time arrangement (nothing nested) supports full editing and hierarchy drill-down; anything else is read-only.
         </div>
       </div>
 
@@ -1118,14 +1208,7 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
         )}
 
         {!isDefaultConfig && (() => {
-          const rowsDim = Object.keys(axisAssignment).find((d) => axisAssignment[d] === 'rows');
-          const colsDim = Object.keys(axisAssignment).find((d) => axisAssignment[d] === 'cols');
-          const rowMembers = pivotMembers(rowsDim, granularity);
-          const colMembers = pivotMembers(colsDim, granularity);
-          const rowsHasTotal = PIVOT_DIMENSIONS[rowsDim]?.hasTotal;
-          const colsHasTotal = PIVOT_DIMENSIONS[colsDim]?.hasTotal;
           const DIM_KEY = { entity: 'entity', account: 'account', time: 'period', product: 'product', scenario: 'scenario' };
-
           function filterValueFor(dim) {
             if (dim === 'entity') return currentEntity;
             if (dim === 'product') return currentProduct;
@@ -1134,79 +1217,90 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
             if (dim === 'time') return filterTime;
             return null;
           }
-          function cellArgs(rowId, colId) {
+          function resolveArgs(rowPath, colPath) {
+            const combined = { ...rowPath, ...colPath };
             const args = {};
             Object.keys(DIM_KEY).forEach((dim) => {
               const key = DIM_KEY[dim];
-              if (dim === rowsDim) args[key] = rowId;
-              else if (dim === colsDim) args[key] = colId;
-              else args[key] = filterValueFor(dim);
+              args[key] = dim in combined ? combined[dim] : filterValueFor(dim);
             });
             return args;
           }
-          function valueAt(rowId, colId) {
-            const a = cellArgs(rowId, colId);
+          function valueAt(rowPath, colPath) {
+            const a = resolveArgs(rowPath, colPath);
             return getPivotCellValue(values, a.scenario, a.entity, a.account, a.period, a.product);
           }
-          function unitFor(rowId, colId) {
-            if (rowsDim === 'account') return ACCOUNTS_BY_ID[rowId]?.unit || '$';
-            if (colsDim === 'account') return ACCOUNTS_BY_ID[colId]?.unit || '$';
+          function unitFor(rowPath, colPath) {
+            const combined = { ...rowPath, ...colPath };
+            if ('account' in combined) return ACCOUNTS_BY_ID[combined.account]?.unit || '$';
             return ACCOUNTS_BY_ID[filterAccount]?.unit || '$';
+          }
+
+          const rowTree = buildPivotTree(rowsOrder, granularity, {});
+          const colTree = buildPivotTree(colsOrder, granularity, {});
+          const colHeaderLevels = pivotColumnHeaderRows(colTree);
+          const colLeaves = flattenPivotLeaves(colTree);
+
+          function renderPivotRowNode(node, depth) {
+            const key = JSON.stringify(node.path);
+            const isExpanded = !pivotCollapsed.has(key);
+            if (node.children) {
+              return (
+                <React.Fragment key={key}>
+                  <tr style={{ borderTop: `1px solid ${COLORS.border}`, background: COLORS.surfaceAlt, cursor: 'pointer' }} onClick={() => togglePivotExpand(node.path)}>
+                    <td style={{ position: 'sticky', left: 0, background: COLORS.surfaceAlt, zIndex: 1 }} className="px-3 py-1.5 whitespace-nowrap text-sm font-semibold">
+                      <span style={{ paddingLeft: depth * 18, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        {isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                        {node.name}
+                      </span>
+                    </td>
+                    <td colSpan={colLeaves.length} style={{ background: COLORS.surfaceAlt }} />
+                  </tr>
+                  {isExpanded && node.children.map((child) => renderPivotRowNode(child, depth + 1))}
+                </React.Fragment>
+              );
+            }
+            return (
+              <tr key={key} className="lw-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
+                <td style={{ position: 'sticky', left: 0, background: node.isTotal ? '#1C2333' : COLORS.surface, color: node.isTotal ? '#fff' : undefined, zIndex: 1 }} className="px-3 py-1.5 whitespace-nowrap text-sm">
+                  <span style={{ paddingLeft: depth * 18, fontWeight: node.isTotal ? 700 : 400 }}>{node.name}</span>
+                </td>
+                {colLeaves.map((c) => (
+                  <td key={JSON.stringify(c.path)} className="px-3 py-1.5 text-right" style={{ background: node.isTotal ? COLORS.violet : (c.isTotal ? COLORS.surfaceAlt : undefined), color: node.isTotal ? '#fff' : undefined }}>
+                    <span className="lw-num" style={{ fontSize: 12.5, fontWeight: (node.isTotal || c.isTotal) ? 600 : 400 }}>{fmtCell(unitFor(node.path, c.path), valueAt(node.path, c.path))}</span>
+                  </td>
+                ))}
+              </tr>
+            );
           }
 
           return (
             <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}` }} className="rounded-lg overflow-hidden">
               <div className="overflow-x-auto">
-                <table style={{ minWidth: (colMembers.length + (colsHasTotal ? 1 : 0)) * 110 + 200, borderCollapse: 'collapse' }} className="w-full text-sm">
+                <table style={{ minWidth: colLeaves.length * 100 + 220, borderCollapse: 'collapse' }} className="w-full text-sm">
                   <thead>
-                    <tr style={{ background: COLORS.bgChrome }}>
-                      <th style={{ position: 'sticky', left: 0, background: COLORS.bgChrome, color: COLORS.textOnDark, zIndex: 2 }} className="text-left px-3 py-2 text-xs font-medium whitespace-nowrap">
-                        {PIVOT_DIMENSIONS[rowsDim]?.label}
-                      </th>
-                      {colMembers.map((c) => (
-                        <th key={c.id} style={{ color: COLORS.textOnDarkMuted }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">{c.name}</th>
-                      ))}
-                      {colsHasTotal && (
-                        <th style={{ color: '#fff', background: '#232B3D' }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">{PIVOT_DIMENSIONS[colsDim].totalName}</th>
-                      )}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rowMembers.map((r) => (
-                      <tr key={r.id} className="lw-row" style={{ borderTop: `1px solid ${COLORS.border}` }}>
-                        <td style={{ position: 'sticky', left: 0, background: COLORS.surface, zIndex: 1 }} className="px-3 py-1.5 whitespace-nowrap text-sm">{r.name}</td>
-                        {colMembers.map((c) => (
-                          <td key={c.id} className="px-3 py-1.5 text-right">
-                            <span className="lw-num" style={{ fontSize: 12.5 }}>{fmtCell(unitFor(r.id, c.id), valueAt(r.id, c.id))}</span>
-                          </td>
-                        ))}
-                        {colsHasTotal && (
-                          <td className="px-3 py-1.5 text-right font-semibold" style={{ background: COLORS.surfaceAlt }}>
-                            <span className="lw-num" style={{ fontSize: 12.5 }}>{fmtCell(unitFor(r.id, PIVOT_DIMENSIONS[colsDim].totalId), valueAt(r.id, PIVOT_DIMENSIONS[colsDim].totalId))}</span>
-                          </td>
+                    {colHeaderLevels.map((levelCells, levelIdx) => (
+                      <tr key={levelIdx} style={{ background: COLORS.bgChrome }}>
+                        {levelIdx === 0 && (
+                          <th rowSpan={colHeaderLevels.length} style={{ position: 'sticky', left: 0, background: COLORS.bgChrome, color: COLORS.textOnDark, zIndex: 2 }} className="text-left px-3 py-2 text-xs font-medium whitespace-nowrap">
+                            {rowsOrder.map((d) => PIVOT_DIMENSIONS[d].label).join(' › ')}
+                          </th>
                         )}
+                        {levelCells.map((cell, i) => (
+                          <th key={i} colSpan={cell.colSpan} style={{ color: cell.isTotal ? '#fff' : COLORS.textOnDarkMuted, background: cell.isTotal ? '#232B3D' : 'transparent' }} className="text-right px-3 py-2 text-xs font-medium whitespace-nowrap">
+                            {cell.name}
+                          </th>
+                        ))}
                       </tr>
                     ))}
-                    {rowsHasTotal && (
-                      <tr style={{ borderTop: `2px solid ${COLORS.textDark}` }}>
-                        <td style={{ position: 'sticky', left: 0, background: '#1C2333', color: '#fff', zIndex: 1 }} className="px-3 py-2 font-bold whitespace-nowrap text-sm">{PIVOT_DIMENSIONS[rowsDim].totalName}</td>
-                        {colMembers.map((c) => (
-                          <td key={c.id} className="px-3 py-2 text-right font-semibold" style={{ background: COLORS.violet, color: '#fff' }}>
-                            <span className="lw-num" style={{ fontSize: 12.5 }}>{fmtCell(unitFor(PIVOT_DIMENSIONS[rowsDim].totalId, c.id), valueAt(PIVOT_DIMENSIONS[rowsDim].totalId, c.id))}</span>
-                          </td>
-                        ))}
-                        {colsHasTotal && (
-                          <td className="px-3 py-2 text-right font-semibold" style={{ background: COLORS.violet, color: '#fff' }}>
-                            <span className="lw-num" style={{ fontSize: 12.5 }}>{fmtCell(unitFor(PIVOT_DIMENSIONS[rowsDim].totalId, PIVOT_DIMENSIONS[colsDim].totalId), valueAt(PIVOT_DIMENSIONS[rowsDim].totalId, PIVOT_DIMENSIONS[colsDim].totalId))}</span>
-                          </td>
-                        )}
-                      </tr>
-                    )}
+                  </thead>
+                  <tbody>
+                    {rowTree.map((node) => renderPivotRowNode(node, 0))}
                   </tbody>
                 </table>
               </div>
-              <div style={{ color: COLORS.textMuted, borderColor: COLORS.border }} className="text-xs px-3 py-2 border-t">
-                Read-only in this arrangement. Switch Rows to Account and Columns to Time to edit values.
+              <div className="text-xs px-3 py-2 border-t" style={{ color: COLORS.textMuted, borderColor: COLORS.border }}>
+                Read-only in this arrangement. Switch Rows to Account and Columns to Time (nothing nested) to edit values.
               </div>
             </div>
           );
