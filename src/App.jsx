@@ -221,6 +221,13 @@ function rollupPathFor(path, dimOrder) {
 ---------------------------------------------------------------------- */
 function childrenOf(id) { return ACCOUNTS.filter((a) => a.parentId === id); }
 function hasChildren(id) { return ACCOUNTS.some((a) => a.parentId === id); }
+// A rollup row stays visible if any descendant is in the subset, even if the
+// rollup itself isn't checked — otherwise a partial selection would leave
+// its children showing with no parent row for context.
+function accountMatchesSubset(accountId, subset) {
+  if (subset.has(accountId)) return true;
+  return childrenOf(accountId).some((c) => accountMatchesSubset(c.id, subset));
+}
 function topAncestor(id) {
   let a = ACCOUNTS_BY_ID[id];
   while (a && a.parentId) a = ACCOUNTS_BY_ID[a.parentId];
@@ -571,21 +578,26 @@ function Workspace({ token, workspaceName, onLogout, onAuthError, onSwitchWorksp
   const isDefaultConfig = rowsOrder.length === 1 && rowsOrder[0] === 'account' && colsOrder.length === 1 && colsOrder[0] === 'time';
 
   const columns = useMemo(() => {
-    if (granularity === 'Monthly') return [...MONTHS, 'FY'];
-    if (granularity === 'Quarterly') return ['Q1', 'Q2', 'Q3', 'Q4', 'FY'];
-    return ['FY'];
-  }, [granularity]);
+    let cols;
+    if (granularity === 'Monthly') cols = [...MONTHS, 'FY'];
+    else if (granularity === 'Quarterly') cols = ['Q1', 'Q2', 'Q3', 'Q4', 'FY'];
+    else cols = ['FY'];
+    const subset = pivotSubsets.time;
+    return subset ? cols.filter((c) => subset.has(c)) : cols;
+  }, [granularity, pivotSubsets.time]);
 
   const visibleRows = useMemo(() => {
     const rows = [];
+    const subset = pivotSubsets.account;
     (function walk(parentId, depth) {
       ACCOUNTS.filter((a) => a.parentId === parentId).forEach((a) => {
+        if (subset && !accountMatchesSubset(a.id, subset)) return;
         rows.push({ ...a, depth });
         if (hasChildren(a.id) && expanded.has(a.id)) walk(a.id, depth + 1);
       });
     })(null, 0);
     return rows;
-  }, [expanded]);
+  }, [expanded, pivotSubsets.account]);
 
   // Moves a dimension to Rows, Columns, or Filter — it's removed from
   // wherever it was and appended as the innermost level of its new axis (if
