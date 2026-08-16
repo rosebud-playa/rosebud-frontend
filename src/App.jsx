@@ -250,6 +250,22 @@ function computeFormula(accountId, get, getForProduct, product) {
 function getValueAt(data, entityId, accountId, month, product) {
   const prod = product || 'all';
   if (entityId === 'company') {
+    // Rate/average measures (cost per FTE, price per unit) can't be summed
+    // across entities the way dollar or unit totals can — a $9,500/FTE
+    // department plus a $12,500/FTE department isn't a $22,000/FTE company.
+    // These are derived as a true weighted average: the dependent dollar
+    // total divided by the dependent volume total, both of which are
+    // genuinely additive and correctly summed via the recursive call below.
+    if (accountId === 'avg_salary') {
+      const totalPersonnel = getValueAt(data, 'company', 'personnel', month, prod);
+      const totalHeadcount = getValueAt(data, 'company', 'headcount', month, prod);
+      return totalHeadcount !== 0 ? totalPersonnel / totalHeadcount : 0;
+    }
+    if (accountId === 'unit_price') {
+      const totalRevenue = getValueAt(data, 'company', 'product_revenue', month, prod);
+      const totalUnits = getValueAt(data, 'company', 'units_sold', month, prod);
+      return totalUnits !== 0 ? totalRevenue / totalUnits : 0;
+    }
     return ENTITIES.reduce((s, e) => s + getValueAt(data, e.id, accountId, month, prod), 0);
   }
   const acc = ACCOUNTS_BY_ID[accountId];
@@ -277,8 +293,22 @@ function getValueAt(data, entityId, accountId, month, product) {
 }
 function getPeriodValue(data, entityId, accountId, period, product) {
   if (MONTHS.includes(period)) return getValueAt(data, entityId, accountId, period, product);
-  if (period === 'FY') return MONTHS.reduce((s, m) => s + getPeriodValue(data, entityId, accountId, m, product), 0);
-  return (QUARTER_MONTHS[period] || []).reduce((s, m) => s + getPeriodValue(data, entityId, accountId, m, product), 0);
+  const periodMonths = period === 'FY' ? MONTHS : (QUARTER_MONTHS[period] || []);
+  // Same non-additive problem, across time instead of across entities — an
+  // average monthly rate isn't meaningful summed across 12 months either.
+  // The weighted average here (sum of dollars ÷ sum of volume across the
+  // period) is the mathematically correct time-weighted average.
+  if (accountId === 'avg_salary') {
+    const totalPersonnel = periodMonths.reduce((s, m) => s + getValueAt(data, entityId, 'personnel', m, product), 0);
+    const totalHeadcount = periodMonths.reduce((s, m) => s + getValueAt(data, entityId, 'headcount', m, product), 0);
+    return totalHeadcount !== 0 ? totalPersonnel / totalHeadcount : 0;
+  }
+  if (accountId === 'unit_price') {
+    const totalRevenue = periodMonths.reduce((s, m) => s + getValueAt(data, entityId, 'product_revenue', m, product), 0);
+    const totalUnits = periodMonths.reduce((s, m) => s + getValueAt(data, entityId, 'units_sold', m, product), 0);
+    return totalUnits !== 0 ? totalRevenue / totalUnits : 0;
+  }
+  return periodMonths.reduce((s, m) => s + getValueAt(data, entityId, accountId, m, product), 0);
 }
 
 /* ----------------------------------------------------------------------
